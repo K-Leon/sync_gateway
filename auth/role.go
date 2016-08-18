@@ -161,7 +161,7 @@ func (role *roleImpl) UnauthError(message string) error {
 func (role *roleImpl) CanSeeChannel(channel string) bool {
 	var wildcard = false
 	if role.Name_ != "" {
-		wildcard = strings.HasPrefix(channel, role.Name_ + "_")
+		wildcard = strings.HasPrefix(channel, role.Name_+"_")
 	}
 	return role == nil || wildcard || role.Channels_.Contains(channel) || role.Channels_.Contains(ch.UserStarChannel)
 }
@@ -171,10 +171,13 @@ func (role *roleImpl) CanSeeChannelSince(channel string) uint64 {
 	seq := role.Channels_[channel]
 	var wildcard = false
 	if role.Name_ != "" {
-		wildcard = strings.HasPrefix(channel, role.Name_ + "_")
+		wildcard = strings.HasPrefix(channel, role.Name_+"_")
 	}
-	if seq.Sequence == 0 || wildcard {
+	if seq.Sequence == 0 {
 		seq = role.Channels_[ch.UserStarChannel]
+	}
+	if wildcard {
+		seq.Sequence = 1
 	}
 	return seq.Sequence
 }
