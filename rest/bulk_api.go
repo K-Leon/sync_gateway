@@ -73,6 +73,15 @@ func (h *handler) handleAllDocs() error {
 			if availableChannels.Contains(ch) {
 				channels[dst] = ch
 				dst++
+			} else {
+				for role := range h.user.ExplicitRoles() {
+					s := strings.Split(role, ":")
+					wildcard := strings.HasPrefix(ch, s[0] + "_")
+					if (wildcard) {
+						channels[dst] = ch
+						dst++
+					}
+				}
 			}
 		}
 		if dst == 0 {

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 
 	"github.com/couchbase/sync_gateway/base"
 	ch "github.com/couchbase/sync_gateway/channels"
@@ -158,13 +159,21 @@ func (role *roleImpl) UnauthError(message string) error {
 // Returns true if the Role is allowed to access the channel.
 // A nil Role means access control is disabled, so the function will return true.
 func (role *roleImpl) CanSeeChannel(channel string) bool {
-	return role == nil || role.Channels_.Contains(channel) || role.Channels_.Contains(ch.UserStarChannel)
+	var wildcard = false
+	if role.Name_ != "" {
+		wildcard = strings.HasPrefix(channel, role.Name_ + "_")
+	}
+	return role == nil || wildcard || role.Channels_.Contains(channel) || role.Channels_.Contains(ch.UserStarChannel)
 }
 
 // Returns the sequence number since which the Role has been able to access the channel, else zero.
 func (role *roleImpl) CanSeeChannelSince(channel string) uint64 {
 	seq := role.Channels_[channel]
-	if seq.Sequence == 0 {
+	var wildcard = false
+	if role.Name_ != "" {
+		wildcard = strings.HasPrefix(channel, role.Name_ + "_")
+	}
+	if seq.Sequence == 0 || wildcard {
 		seq = role.Channels_[ch.UserStarChannel]
 	}
 	return seq.Sequence
