@@ -85,9 +85,14 @@ type DatabaseContextOptions struct {
 	OIDCOptions           *auth.OIDCOptions
 }
 
+type OidcTestProviderOptions struct {
+	Enabled         bool `json:"enabled,omitempty"`           // Whether the oidc_test_provider endpoints should be exposed on the public API
+	UnsignedIDToken bool `json:"unsigned_id_token,omitempty"` // Whether the internal test provider returns a signed ID token on a refresh request.  Used to simulate Azure behaviour
+}
+
 type UnsupportedOptions struct {
-	EnableUserViews        bool
-	EnableOidcTestProvider bool
+	EnableUserViews  bool
+	OidcTestProvider OidcTestProviderOptions
 }
 
 const DefaultRevsLimit = 1000
@@ -115,11 +120,25 @@ func ValidateDatabaseName(dbName string) error {
 
 // Helper function to open a Couchbase connection and return a specific bucket.
 func ConnectToBucket(spec base.BucketSpec, callback func(bucket string, err error)) (bucket base.Bucket, err error) {
-	bucket, err = base.GetBucket(spec, callback)
+	//start a retry loop to connect to the bucket backing off double the delay each time
+	worker := func() (shouldRetry bool, err error, value interface{}) {
+		bucket, err = base.GetBucket(spec, callback)
+		return err != nil, err, bucket
+	}
+
+	sleeper := base.CreateDoublingSleeperFunc(
+		13, //MaxNumRetries approx 40 seconds total retry duration
+		5,  //InitialRetrySleepTimeMS
+	)
+
+	description := fmt.Sprintf("Attempt to connect to bucket : %v", spec.BucketName)
+	err, ibucket := base.RetryLoop(description, worker, sleeper)
+
 	if err != nil {
 		err = base.HTTPErrorf(http.StatusBadGateway,
 			" Unable to connect to Couchbase Server (connection refused). Please ensure it is running and reachable at the configured host and port.  Detailed error: %s", err)
 	} else {
+		bucket, _ := ibucket.(base.Bucket)
 		err = installViews(bucket)
 	}
 	return
@@ -172,10 +191,16 @@ func NewDatabaseContext(dbName string, bucket base.Bucket, autoImport bool, opti
 	}, options.CacheOptions, options.IndexOptions)
 	context.SetOnChangeCallback(context.changeCache.DocChanged)
 
-	if err = context.tapListener.Start(bucket, options.TrackDocs, func(bucket string, err error) {
-		context.TakeDbOffline("Lost TAP Feed")
-	}); err != nil {
-		return nil, err
+	// Initialize the tap Listener for notify handling
+	context.tapListener.Init(bucket.GetName())
+
+	// If not using channel index or using channel index and tracking docs, start the tap feed
+	if options.IndexOptions == nil || options.TrackDocs {
+		if err = context.tapListener.Start(bucket, options.TrackDocs, func(bucket string, err error) {
+			context.TakeDbOffline("Lost TAP Feed")
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// Load providers into provider map.  Does basic validation on the provider definition, and identifies the default provider.
@@ -293,6 +318,7 @@ func (context *DatabaseContext) RestartListener() error {
 	context.tapListener.Stop()
 	// Delay needed to properly stop
 	time.Sleep(2 * time.Second)
+	context.tapListener.Init(context.Bucket.GetName())
 	if err := context.tapListener.Start(context.Bucket, context.Options.TrackDocs, nil); err != nil {
 		return err
 	}
@@ -521,15 +547,40 @@ func installViews(bucket base.Bucket) error {
 	                    }
 	               }`
 
+	// Vbucket sequence version of role access view, used by ComputeRolesForUser()
+	// Key is username; value is dictionary channelName->firstSequence (compatible with TimedSet)
+
+	roleAccess_vbSeq_map := `function (doc, meta) {
+		                    var sync = doc._sync;
+		                    if (sync === undefined || meta.id.substring(0,6) == "_sync:")
+		                        return;
+		                    var access = sync.role_access;
+		                    if (access) {
+		                        for (var name in access) {
+		                        	// Build a timed set based on vb and vbseq of this revision
+		                        	var value = {};
+		                        	for (var role in access[name]) {
+		                        		var timedSetWithVbucket = {};
+				                        timedSetWithVbucket["vb"] = parseInt(meta.vb, 10);
+				                        timedSetWithVbucket["seq"] = parseInt(meta.seq, 10);
+				                        value[role] = timedSetWithVbucket;
+			                        }
+		                            emit(name, value)
+		                        }
+
+		                    }
+		               }`
+
 	designDocMap := map[string]sgbucket.DesignDoc{}
 
 	designDocMap[DesignDocSyncGateway] = sgbucket.DesignDoc{
 		Views: sgbucket.ViewMap{
-			ViewPrincipals:  sgbucket.ViewDef{Map: principals_map},
-			ViewChannels:    sgbucket.ViewDef{Map: channels_map},
-			ViewAccess:      sgbucket.ViewDef{Map: access_map},
-			ViewAccessVbSeq: sgbucket.ViewDef{Map: access_vbSeq_map},
-			ViewRoleAccess:  sgbucket.ViewDef{Map: roleAccess_map},
+			ViewPrincipals:      sgbucket.ViewDef{Map: principals_map},
+			ViewChannels:        sgbucket.ViewDef{Map: channels_map},
+			ViewAccess:          sgbucket.ViewDef{Map: access_map},
+			ViewAccessVbSeq:     sgbucket.ViewDef{Map: access_vbSeq_map},
+			ViewRoleAccess:      sgbucket.ViewDef{Map: roleAccess_map},
+			ViewRoleAccessVbSeq: sgbucket.ViewDef{Map: roleAccess_vbSeq_map},
 		},
 	}
 
@@ -543,10 +594,27 @@ func installViews(bucket base.Bucket) error {
 		},
 	}
 
+	sleeper := base.CreateDoublingSleeperFunc(
+		11, //MaxNumRetries approx 10 seconds total retry duration
+		5,  //InitialRetrySleepTimeMS
+	)
+
 	// add all design docs from map into bucket
 	for designDocName, designDoc := range designDocMap {
-		if err := bucket.PutDDoc(designDocName, designDoc); err != nil {
-			base.Warn("Error installing Couchbase design doc: %v", err)
+
+		//start a retry loop to put design document backing off double the delay each time
+		worker := func() (shouldRetry bool, err error, value interface{}) {
+			err = bucket.PutDDoc(designDocName, designDoc)
+			if err != nil {
+				base.Warn("Error installing Couchbase design doc: %v", err)
+			}
+			return err != nil, err, nil
+		}
+
+		description := fmt.Sprintf("Attempt to install Couchbase design doc bucket : %v", designDocName)
+		err, _ := base.RetryLoop(description, worker, sleeper)
+
+		if err != nil {
 			return err
 		}
 	}

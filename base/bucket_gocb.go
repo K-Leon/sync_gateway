@@ -12,6 +12,7 @@ package base
 import (
 	"expvar"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/couchbase/gocb"
@@ -120,18 +121,30 @@ func GetCouchbaseBucketGoCB(spec BucketSpec) (bucket Bucket, err error) {
 
 }
 
+func (bucket CouchbaseBucketGoCB) GetBucketCredentials() (username, password string) {
+
+	if bucket.spec.Auth != nil {
+		_, password, _ = bucket.spec.Auth.GetCredentials()
+	}
+	return bucket.spec.BucketName, password
+}
+
 func (bucket CouchbaseBucketGoCB) GetName() string {
 	return bucket.spec.BucketName
 }
 
 func (bucket CouchbaseBucketGoCB) GetRaw(k string) (rv []byte, cas uint64, err error) {
 
-	var returnVal interface{}
+	var returnVal []byte
 	cas, err = bucket.Get(k, &returnVal)
 	if returnVal == nil {
 		return nil, cas, err
 	}
-	return returnVal.([]byte), cas, err
+	// Take a copy of the returned value until gocb issue is fixed http://review.couchbase.org/#/c/72059/
+	rv = make([]byte, len(returnVal))
+	copy(rv, returnVal)
+
+	return rv, cas, err
 
 }
 
@@ -334,6 +347,51 @@ func (bucket CouchbaseBucketGoCB) GetBulkRaw(keys []string) (map[string][]byte, 
 
 }
 
+// Retrieve keys in bulk for increased efficiency.  If any keys are not found, they
+// will not be returned, and so the size of the map may be less than the size of the
+// keys slice, and no error will be returned in that case since it's an expected
+// situation.
+//
+// If there is an "overall error" calling the underlying GoCB bulk operation, then
+// that error will be returned.
+//
+// If there are errors on individual keys -- aside from "not found" errors -- such as
+// QueueOverflow errors that can be retried successfully, they will be retried
+// with a backoff loop.
+func (bucket CouchbaseBucketGoCB) GetBulkCounters(keys []string) (map[string]uint64, error) {
+
+	gocbExpvars.Add("GetBulkRaw", 1)
+	gocbExpvars.Add("GetBulkRaw_totalKeys", int64(len(keys)))
+
+	// Create a RetryWorker for the GetBulkRaw operation
+	worker := bucket.newGetBulkCountersRetryWorker(keys)
+
+	// this is the function that will be called back by the RetryLoop to determine
+	// how long to sleep before retrying (uses backoff)
+	sleeper := CreateDoublingSleeperFunc(
+		bucket.spec.MaxNumRetries,
+		bucket.spec.InitialRetrySleepTimeMS,
+	)
+
+	// Kick off retry loop
+	description := fmt.Sprintf("GetBulkRaw with %v keys", len(keys))
+	err, result := RetryLoop(description, worker, sleeper)
+
+	// If the RetryLoop returns a nil result, convert to an empty map.
+	if result == nil {
+		return map[string]uint64{}, err
+	}
+
+	// Type assertion of result into a map
+	resultMap, ok := result.(map[string]uint64)
+	if !ok {
+		return nil, fmt.Errorf("Error doing type assertion of %v into a map", result)
+	}
+
+	return resultMap, err
+
+}
+
 func (bucket CouchbaseBucketGoCB) newGetBulkRawRetryWorker(keys []string) RetryWorker {
 
 	// resultAccumulator scoped in closure, will accumulate results across multiple worker invocations
@@ -350,7 +408,7 @@ func (bucket CouchbaseBucketGoCB) newGetBulkRawRetryWorker(keys []string) RetryW
 
 			// process batch and add successful results to resultAccumulator
 			// and recoverable (non "Not Found") errors to retryKeys
-			err := bucket.processGetBatch(keyBatch, resultAccumulator, retryKeys)
+			err := bucket.processGetRawBatch(keyBatch, resultAccumulator, retryKeys)
 			if err != nil {
 				return false, err, nil
 			}
@@ -374,7 +432,47 @@ func (bucket CouchbaseBucketGoCB) newGetBulkRawRetryWorker(keys []string) RetryW
 
 }
 
-func (bucket CouchbaseBucketGoCB) processGetBatch(keys []string, resultAccumulator map[string][]byte, retryKeys []string) error {
+func (bucket CouchbaseBucketGoCB) newGetBulkCountersRetryWorker(keys []string) RetryWorker {
+
+	// resultAccumulator scoped in closure, will accumulate results across multiple worker invocations
+	resultAccumulator := make(map[string]uint64, len(keys))
+
+	// pendingKeys scoped in closure, represents set of keys that still need to be attempted or re-attempted
+	pendingKeys := keys
+
+	worker := func() (shouldRetry bool, err error, value interface{}) {
+
+		retryKeys := []string{}
+		keyBatches := createBatchesKeys(MaxBulkBatchSize, pendingKeys)
+		for _, keyBatch := range keyBatches {
+
+			// process batch and add successful results to resultAccumulator
+			// and recoverable (non "Not Found") errors to retryKeys
+			err := bucket.processGetCountersBatch(keyBatch, resultAccumulator, retryKeys)
+			if err != nil {
+				return false, err, nil
+			}
+
+		}
+
+		// if there are no keys to retry, then we're done.
+		if len(retryKeys) == 0 {
+			return false, nil, resultAccumulator
+		}
+
+		// otherwise, retry the keys the need to be retried
+		keys = retryKeys
+
+		// return true to signal that this function needs to be retried
+		return true, nil, nil
+
+	}
+
+	return worker
+
+}
+
+func (bucket CouchbaseBucketGoCB) processGetRawBatch(keys []string, resultAccumulator map[string][]byte, retryKeys []string) error {
 
 	var items []gocb.BulkOp
 	for _, key := range keys {
@@ -399,6 +497,48 @@ func (bucket CouchbaseBucketGoCB) processGetBatch(keys []string, resultAccumulat
 			byteValue, ok := getOp.Value.(*[]byte)
 			if ok {
 				resultAccumulator[getOp.Key] = *byteValue
+			} else {
+				Warn("Skipping GetBulkRaw result - unable to cast to []byte.  Type: %v", reflect.TypeOf(getOp.Value))
+			}
+		} else {
+			// if it's a recoverable error, then throw it in retry collection.
+			if isRecoverableGoCBError(getOp.Err) {
+				retryKeys = append(retryKeys, getOp.Key)
+			}
+		}
+
+	}
+
+	return nil
+}
+
+func (bucket CouchbaseBucketGoCB) processGetCountersBatch(keys []string, resultAccumulator map[string]uint64, retryKeys []string) error {
+
+	var items []gocb.BulkOp
+	for _, key := range keys {
+		var value uint64
+		item := &gocb.GetOp{Key: key, Value: &value}
+		items = append(items, item)
+	}
+	err := bucket.Do(items)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		getOp, ok := item.(*gocb.GetOp)
+		if !ok {
+			continue
+		}
+		// Ignore any ops with errors.
+		// NOTE: some of the errors are misleading:
+		// https://issues.couchbase.com/browse/GOCBC-64
+		if getOp.Err == nil {
+			intValue, ok := getOp.Value.(*uint64)
+			if ok {
+				resultAccumulator[getOp.Key] = *intValue
+			} else {
+				Warn("Skipping GetBulkCounter result - unable to cast to []byte.  Type: %v", reflect.TypeOf(getOp.Value))
 			}
 		} else {
 			// if it's a recoverable error, then throw it in retry collection.
@@ -697,8 +837,8 @@ func (bucket CouchbaseBucketGoCB) WriteCas(k string, flags int, exp int, cas uin
 	}()
 
 	// we only support the sgbucket.Raw WriteOption at this point
-	if opt != sgbucket.Raw {
-		LogPanic("WriteOption must be sgbucket.Raw")
+	if opt != 0 && opt != sgbucket.Raw {
+		LogPanic("WriteOption must be empty or sgbucket.Raw")
 	}
 
 	// also, flags must be 0, since that is not supported by gocb
@@ -876,8 +1016,32 @@ func (bucket CouchbaseBucketGoCB) GetDDoc(docname string, into interface{}) erro
 }
 
 func (bucket CouchbaseBucketGoCB) PutDDoc(docname string, value interface{}) error {
-	LogPanic("Unimplemented method: PutDDoc()")
-	return nil
+
+	// Get bucket manager.  Relies on existing auth settings for bucket.
+	username, password := bucket.GetBucketCredentials()
+	manager := bucket.Bucket.Manager(username, password)
+	if manager == nil {
+		return fmt.Errorf("Unable to obtain manager for bucket %s - cannot PUT design doc %s", bucket.GetName(), docname)
+	}
+
+	sgDesignDoc, ok := value.(sgbucket.DesignDoc)
+	if !ok {
+		return fmt.Errorf("Unable to identify specified design document")
+	}
+
+	gocbDesignDoc := &gocb.DesignDocument{
+		Name:  docname,
+		Views: make(map[string]gocb.View),
+	}
+
+	for viewName, view := range sgDesignDoc.Views {
+		gocbView := gocb.View{
+			Map: view.Map,
+		}
+		gocbDesignDoc.Views[viewName] = gocbView
+	}
+
+	return manager.InsertDesignDocument(gocbDesignDoc)
 }
 
 func (bucket CouchbaseBucketGoCB) DeleteDDoc(docname string) error {
@@ -895,10 +1059,9 @@ func (bucket CouchbaseBucketGoCB) ViewCustom(ddoc, name string, params map[strin
 	return nil
 }
 
-
-func (bucket CouchbaseBucketGoCB)  Refresh() error {
+func (bucket CouchbaseBucketGoCB) Refresh() error {
 	LogPanic("Unimplemented method: Refresh()")
-	return nil;
+	return nil
 }
 
 func (bucket CouchbaseBucketGoCB) StartTapFeed(args sgbucket.TapArguments) (sgbucket.TapFeed, error) {
@@ -906,15 +1069,19 @@ func (bucket CouchbaseBucketGoCB) StartTapFeed(args sgbucket.TapArguments) (sgbu
 	return nil, nil
 }
 
-func (bucket CouchbaseBucketGoCB) Close() {
-	LogPanic("Unimplemented method: Close()")
-}
-
 func (bucket CouchbaseBucketGoCB) Dump() {
-	LogPanic("Unimplemented method: Dump()")
+	Warn("CouchbaseBucketGoCB: Unimplemented method: Dump()")
 }
 
 func (bucket CouchbaseBucketGoCB) VBHash(docID string) uint32 {
-	LogPanic("Unimplemented method: VBHash()")
-	return 0
+	numVbuckets := bucket.Bucket.IoRouter().NumVbuckets()
+	return VBHash(docID, numVbuckets)
+}
+
+func (bucket CouchbaseBucketGoCB) GetMaxVbno() (uint16, error) {
+
+	if bucket.Bucket.IoRouter() != nil {
+		return uint16(bucket.Bucket.IoRouter().NumVbuckets()), nil
+	}
+	return 0, fmt.Errorf("Unable to determine vbucket count")
 }

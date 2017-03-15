@@ -18,15 +18,24 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/couchbase/sync_gateway/base"
 )
 
 const kHashPrefix = "_sequence:"
-const kDefaultHashExpiry = uint32(2592000)
+const kDefaultHashExpiry = uint32(2592000) //30days in seconds
 const kDefaultSize = uint8(32)
 const kDefaultHasherCacheCapacity = 500
 const kDefaultChangesHashFrequency = 100
+
+var sequenceHasherGetHashTime = base.NewIntRollingMeanVar(100)
+var sequenceHasherGetClockTime = base.NewIntRollingMeanVar(100)
+
+func init() {
+	base.StatsExpvars.Set("indexReader.seqHasher.GetHash", &sequenceHasherGetHashTime)
+	base.StatsExpvars.Set("indexReader.seqHasher.GetClockTime", &sequenceHasherGetClockTime)
+}
 
 type sequenceHasher struct {
 	bucket        base.Bucket              // Bucket to store hashed instances
@@ -116,6 +125,8 @@ func (s *sequenceHasher) calculateHash(clock base.SequenceClock) uint64 {
 
 func (s *sequenceHasher) GetHash(clock base.SequenceClock) (string, error) {
 
+	defer sequenceHasherGetHashTime.AddSince(time.Now())
+
 	if clock == nil {
 		return "", errors.New("Can't calculate hash for nil clock")
 	}
@@ -176,7 +187,7 @@ func (s *sequenceHasher) GetHash(clock base.SequenceClock) (string, error) {
 		if err != nil {
 			return err
 		}
-		_, err = base.WriteCasRaw(s.bucket, key, initialValue, existingClocks.cas, int(s.hashExpiry), func(value []byte) (updatedValue []byte, err error) {
+		_, err = base.WriteCasRaw(s.bucket, key, initialValue, existingClocks.cas, base.SecondsToCbsExpiry(int(s.hashExpiry)), func(value []byte) (updatedValue []byte, err error) {
 			// Note: The following is invoked upon cas failure - may be called multiple times
 			base.LogTo("DIndex+", "CAS fail - reapplying changes for hash storage for key: %s", key)
 			var sClocks storedClocks
@@ -216,8 +227,9 @@ func (s *sequenceHasher) GetHash(clock base.SequenceClock) (string, error) {
 	return seqHash.String(), nil
 }
 
-func (s *sequenceHasher) GetClock(sequence string) (base.SequenceClock, error) {
+func (s *sequenceHasher) GetClock(sequence string) (*base.SequenceClockImpl, error) {
 
+	defer sequenceHasherGetClockTime.AddSince(time.Now())
 	clock := base.NewSequenceClockImpl()
 	var err error
 	var seqHash sequenceHash
@@ -241,12 +253,13 @@ func (s *sequenceHasher) GetClock(sequence string) (base.SequenceClock, error) {
 	}
 
 	cachedValue := s.getCacheValue(seqHash.hashValue)
-	storedClocks, loadErr := cachedValue.load(s.loadClocks)
+	storedClocks, loadErr := cachedValue.loadForIndex(s.loadClocks, seqHash.collisionIndex)
 	if loadErr != nil {
 		return clock, loadErr
 	}
 
 	if uint16(len(storedClocks.Sequences)) <= seqHash.collisionIndex {
+		base.LogTo("Changes+", "Stored hash not found for sequence [%s] collision index [%d], #storedClocks:%d", sequence, seqHash.collisionIndex, len(storedClocks.Sequences))
 		return clock, errors.New(fmt.Sprintf("Stored hash not found for sequence [%s], returning zero clock", sequence))
 	}
 	clock = base.NewSequenceClockImpl()
@@ -308,6 +321,24 @@ func (value *hashCacheValue) load(loaderFunc SeqHashCacheLoaderFunc) (*storedClo
 	return value.clocks.Copy(), value.err
 }
 
+// Gets the stored clocks out of a hashCacheValue, targeting a specific collision index.
+// If the targeted index is not found, will attempt to load from the index bucket
+func (value *hashCacheValue) loadForIndex(loaderFunc SeqHashCacheLoaderFunc, collisionIndex uint16) (*storedClocks, error) {
+	value.lock.Lock()
+	defer value.lock.Unlock()
+
+	// If clocks haven't been cached, or cache doesn't include target index, reload
+	if value.clocks == nil || collisionIndex >= uint16(len(value.clocks.Sequences)) {
+		IndexExpvars.Add("seqHashCache_misses", 1)
+		value.clocks, value.err = loaderFunc(value.key)
+	} else {
+		IndexExpvars.Add("seqHashCacheCache_hits", 1)
+	}
+
+	// return a copy to ensure cache values don't get mutated outside of a hashCacheValue.store
+	return value.clocks.Copy(), value.err
+}
+
 // Stores a body etc. into a revCacheValue if there isn't one already.
 func (value *hashCacheValue) store(clocks *storedClocks) {
 	value.lock.Lock()
@@ -321,7 +352,7 @@ func (s *sequenceHasher) loadClocks(hashValue uint64) (*storedClocks, error) {
 	stored := storedClocks{}
 	key := kHashPrefix + strconv.FormatUint(hashValue, 10)
 
-	bytes, cas, err := s.bucket.GetAndTouchRaw(key, int(s.hashExpiry))
+	bytes, cas, err := s.bucket.GetAndTouchRaw(key, base.SecondsToCbsExpiry(int(s.hashExpiry)))
 	IndexExpvars.Add("get_hashLoadClocks", 1)
 
 	if err != nil {

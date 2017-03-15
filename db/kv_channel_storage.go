@@ -30,31 +30,31 @@ const (
 	kSequenceOffsetLength = 0 // disabled until we actually need it
 )
 
-// ChannelStorage implemented as an interface, to support swapping to different underlying storage model
+// ChannelStorage implemented as two interfaces, to support swapping to different underlying storage model
 // without significant refactoring.
-type ChannelStorage interface {
+type ChannelStorageReader interface {
+	// GetAllEntries returns all entries for the channel in the specified range, for all vbuckets
+	GetChanges(fromSeq base.SequenceClock, channelClock base.SequenceClock, limit int) ([]*LogEntry, error)
+	UpdateCache(fromSeq base.SequenceClock, channelClock base.SequenceClock, changedPartitions []*base.PartitionRange) error
+}
+
+type ChannelStorageWriter interface {
 
 	// AddEntrySet adds a set of entries to the channel index
-	AddEntrySet(entries []*LogEntry) (clockUpdates base.SequenceClock, err error)
-
-	// GetAllEntries returns all entries for the channel in the specified range, for all vbuckets
-	GetChanges(fromSeq base.SequenceClock, channelClock base.SequenceClock) ([]*LogEntry, error)
+	AddEntrySet(entries []*LogEntry) (clockUpdates []*base.PartitionClock, err error)
+	RollbackTo(rollbackVbNo uint16, rollbackSeq uint64) error
 
 	// If channel storage implementation uses separate storage for log entries and channel presence,
 	// WriteLogEntry and ReadLogEntry can be used to read/write.  Useful when changeIndex wants to
 	// manage these document outside the scope of a channel.  StoresLogEntries() allows callers to
 	// check whether this is available.
 	StoresLogEntries() bool
-	ReadLogEntry(vbNo uint16, sequence uint64) (*LogEntry, error)
 	WriteLogEntry(entry *LogEntry) error
-
-	// For unit testing only
-	getIndexBlockForEntry(entry *LogEntry) IndexBlock
 }
 
-func NewChannelStorage(bucket base.Bucket, channelName string, partitions *base.IndexPartitions) ChannelStorage {
-	return NewBitFlagStorage(bucket, channelName, partitions)
-
+type ChannelStorage interface {
+	ChannelStorageReader
+	ChannelStorageWriter
 }
 
 // Bit flag values
@@ -125,11 +125,11 @@ func (b *BitFlagStorage) readIndexEntryInto(vbNo uint16, sequence uint64, entry 
 }
 
 // Adds a set
-func (b *BitFlagStorage) AddEntrySet(entries []*LogEntry) (clockUpdates base.SequenceClock, err error) {
+func (b *BitFlagStorage) AddEntrySet(entries []*LogEntry) (partitionUpdates []*base.PartitionClock, err error) {
 
 	// Update the sequences in the appropriate cache block
 	if len(entries) == 0 {
-		return clockUpdates, nil
+		return partitionUpdates, nil
 	}
 
 	// The set of updates may be distributed over multiple partitions and blocks.
@@ -139,10 +139,10 @@ func (b *BitFlagStorage) AddEntrySet(entries []*LogEntry) (clockUpdates base.Seq
 	//       same block as the first entry in the list, but this would force sequential
 	//       processing of the blocks.  Might be worth revisiting if we see high GC overhead.
 	blockSets := make(BlockSet)
-	clockUpdates = base.NewSequenceClockImpl()
+	clockUpdates := base.NewSequenceClockImpl()
 	for _, entry := range entries {
 		// Update the sequence in the appropriate cache block
-		base.LogTo("DIndex+", "Add to channel index [%s], vbNo=%d, isRemoval:%v", b.channelName, entry.VbNo, entry.isRemoved())
+		base.LogTo("DIndex+", "Add to channel index [%s], vbNo=%d, isRemoval:%v", b.channelName, entry.VbNo, entry.IsRemoved())
 		blockKey := GenerateBlockKey(b.channelName, entry.Sequence, b.partitions.VbMap[entry.VbNo])
 		if _, ok := blockSets[blockKey]; !ok {
 			blockSets[blockKey] = make([]*LogEntry, 0)
@@ -154,9 +154,15 @@ func (b *BitFlagStorage) AddEntrySet(entries []*LogEntry) (clockUpdates base.Seq
 	err = b.writeBlockSetsWithCas(blockSets)
 	if err != nil {
 		base.Warn("Error writing blockSets with cas for block %s: %+v", blockSets, err)
+		return partitionUpdates, err
 	}
 
-	return clockUpdates, err
+	partitionUpdates = base.ConvertClockToPartitionClocks(clockUpdates, *b.partitions)
+	return partitionUpdates, nil
+}
+
+func (b *BitFlagStorage) RollbackTo(rollbackVbNo uint16, rollbackSeq uint64) error {
+	return errors.New("Not implemented: BitFlagStorage.RollbackTo")
 }
 
 func (b *BitFlagStorage) writeBlockSetsWithCas(blockSets BlockSet) error {
@@ -291,7 +297,7 @@ func (b *BitFlagStorage) loadBlock(block IndexBlock) error {
 	return nil
 }
 
-func (b *BitFlagStorage) GetChanges(fromSeq base.SequenceClock, toSeq base.SequenceClock) ([]*LogEntry, error) {
+func (b *BitFlagStorage) GetChanges(fromSeq base.SequenceClock, toSeq base.SequenceClock, limit int) ([]*LogEntry, error) {
 
 	// Determine which blocks have changed, and load those blocks
 	blocksByKey, blocksByVb, err := b.calculateChangedBlocks(fromSeq, toSeq)
@@ -323,6 +329,11 @@ func (b *BitFlagStorage) GetChanges(fromSeq base.SequenceClock, toSeq base.Seque
 
 	return results, nil
 
+}
+
+func (b *BitFlagStorage) UpdateCache(sinceClock base.SequenceClock, toClock base.SequenceClock, changedPartitions []*base.PartitionRange) error {
+	// no-op, not a caching reader
+	return nil
 }
 
 type vbBlockSet struct {
@@ -426,15 +437,19 @@ func (b *BitFlagStorage) bulkLoadEntries(keySet []string, blockEntries []*LogEnt
 		}
 
 		entryKey := getEntryKey(entry.VbNo, entry.Sequence)
-		entryBytes := entries[entryKey]
-		removed := entry.isRemoved()
+		entryBytes, ok := entries[entryKey]
+		if !ok || entryBytes == nil {
+			base.Warn("Expected entry for %s in get bulk response - not found", entryKey)
+			continue
+		}
+		removed := entry.IsRemoved()
 		if err := json.Unmarshal(entryBytes, entry); err != nil {
 			base.Warn("Error unmarshalling entry for key %s: %v", entryKey, err)
 		}
 		if _, exists := currentVbDocIDs[entry.DocID]; !exists {
 			currentVbDocIDs[entry.DocID] = struct{}{}
 			if removed {
-				entry.setRemoved()
+				entry.SetRemoved()
 			}
 			// TODO: optimize performance for prepend?
 			results = append([]*LogEntry{entry}, results...)
@@ -639,7 +654,7 @@ func (b *BitFlagBlock) AddEntry(entry *LogEntry) error {
 	if index < 0 || index >= uint64(len(b.value.Entries[entry.VbNo])) {
 		return errors.New("Sequence out of range of block")
 	}
-	if entry.isRemoved() {
+	if entry.IsRemoved() {
 		b.value.Entries[entry.VbNo][index] = byte(Seq_Removed)
 	} else {
 		b.value.Entries[entry.VbNo][index] = byte(Seq_InChannel)
@@ -662,7 +677,7 @@ func (b *BitFlagBlock) GetAllEntries() []*LogEntry {
 					Sequence: b.value.MinSequence + uint64(index),
 				}
 				if removed {
-					newEntry.setRemoved()
+					newEntry.SetRemoved()
 				}
 				results = append(results, newEntry)
 			}
@@ -709,7 +724,7 @@ func (b *BitFlagBlock) GetEntries(vbNo uint16, fromSeq uint64, toSeq uint64, inc
 				Sequence: b.value.MinSequence + uint64(index),
 			}
 			if removed {
-				newEntry.setRemoved()
+				newEntry.SetRemoved()
 			}
 			entries = append(entries, newEntry)
 			if includeKeys {
@@ -794,7 +809,7 @@ func (b *BitFlagBufferBlock) AddEntry(entry *LogEntry) error {
 	if err != nil {
 		return err
 	}
-	if entry.isRemoved() {
+	if entry.IsRemoved() {
 		b.value[index] = byte(2)
 	} else {
 		b.value[index] = byte(1)
@@ -814,7 +829,7 @@ func (b *BitFlagBufferBlock) GetAllEntries() []*LogEntry {
 					Sequence: b.minSequence + uint64(index),
 				}
 				if removed {
-					newEntry.setRemoved()
+					newEntry.SetRemoved()
 				}
 				results = append(results, newEntry)
 			}
@@ -859,7 +874,7 @@ func (b *BitFlagBufferBlock) GetEntries(vbNo uint16, fromSeq uint64, toSeq uint6
 				Sequence: b.minSequence + uint64(index),
 			}
 			if removed {
-				newEntry.setRemoved()
+				newEntry.SetRemoved()
 			}
 			entries = append(entries, newEntry)
 			if includeKeys {
@@ -927,7 +942,7 @@ func readIndexEntriesInto(bucket base.Bucket, keys []string, entries map[string]
 				base.Warn("Error unmarshalling entry")
 			}
 			if removed {
-				entry.setRemoved()
+				entry.SetRemoved()
 			}
 		}
 	}
@@ -937,7 +952,7 @@ func readIndexEntriesInto(bucket base.Bucket, keys []string, entries map[string]
 
 // Generate the key for a single sequence/entry
 func getEntryKey(vbNo uint16, sequence uint64) string {
-	return fmt.Sprintf("%s_entry:%d:%d", kIndexPrefix, vbNo, sequence)
+	return fmt.Sprintf("%s_entry:%d:%d", base.KIndexPrefix, vbNo, sequence)
 }
 
 func getSuffixForVbNo(vbNo uint16) string {

@@ -24,7 +24,6 @@ import (
 )
 
 const (
-	kIndexPrefix   = "_idx"
 	kPollFrequency = 500
 )
 
@@ -50,7 +49,7 @@ func (k *kvChangeIndex) Init(context *DatabaseContext, lastSequence SequenceID, 
 
 	k.context = context
 	k.reader = &kvChangeIndexReader{}
-	err = k.reader.Init(options, indexOptions, onChange, k.getIndexPartitions)
+	err = k.reader.Init(options, indexOptions, onChange, k.getIndexPartitions, k.context)
 	if err != nil {
 		return err
 	}
@@ -67,7 +66,6 @@ func (k *kvChangeIndex) Clear() {
 }
 
 func (k *kvChangeIndex) Stop() {
-
 	k.reader.Stop()
 }
 

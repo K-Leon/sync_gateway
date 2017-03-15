@@ -35,6 +35,7 @@ const kStatsReportURL = "http://localhost:9999/stats"
 const kStatsReportInterval = time.Hour
 const kDefaultSlowServerCallWarningThreshold = 200 // ms
 const kOneShotLocalDbReplicateWait = 10 * time.Second
+const KDefaultNumShards = 16
 
 // Shared context of HTTP handlers: primarily a registry of databases by name. It also stores
 // the configuration settings so handlers can refer to them.
@@ -313,10 +314,7 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 		PoolName:   pool,
 		BucketName: bucketName,
 		FeedType:   feedType,
-	}
-
-	if config.Username != "" {
-		spec.Auth = config
+		Auth:       config,
 	}
 
 	// Set cache properties, if present
@@ -357,13 +355,19 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 
 				//start a retry loop to pick up tap feed again backing off double the delay each time
 				worker := func() (shouldRetry bool, err error, value interface{}) {
-					err = dc.Bucket.Refresh()
+					//If DB is going online via an admin request Bucket will be nil
+					if dc.Bucket != nil {
+						err = dc.Bucket.Refresh()
+					} else {
+						err = base.HTTPErrorf(http.StatusPreconditionFailed, "Database %q, bucket is not available", dbName)
+						return false, err, nil
+					}
 					return err != nil, err, nil
 				}
 
 				sleeper := base.CreateDoublingSleeperFunc(
 					20, //MaxNumRetries
-					5,   //InitialRetrySleepTimeMS
+					5,  //InitialRetrySleepTimeMS
 				)
 
 				description := fmt.Sprintf("Attempt reconnect to lost TAP Feed for : %v", dc.Name)
@@ -413,7 +417,7 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 		if config.ChannelIndex.NumShards != 0 {
 			channelIndexOptions.NumShards = config.ChannelIndex.NumShards
 		} else {
-			channelIndexOptions.NumShards = 64
+			channelIndexOptions.NumShards = KDefaultNumShards
 		}
 
 		channelIndexOptions.ValidateOrPanic()
@@ -465,9 +469,7 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 			}
 		}
 		if config.Unsupported.OidcTestProvider != nil {
-			if config.Unsupported.OidcTestProvider.Enabled != nil {
-				unsupportedOptions.EnableOidcTestProvider = *config.Unsupported.OidcTestProvider.Enabled
-			}
+			unsupportedOptions.OidcTestProvider = *config.Unsupported.OidcTestProvider
 		}
 	}
 

@@ -17,7 +17,7 @@ func init() {
 
 const (
 	KIndexPartitionKey       = "_idxPartitionMap"
-	kIndexPrefix             = "_idx"
+	KIndexPrefix             = "_idx"
 	kCountKeyFormat          = "_idx_c:%s:count"    // key
 	kClockPartitionKeyFormat = "_idx_c:%s:clock-%d" // key, partition index
 	KPrincipalCountKeyFormat = "_idx_p_count:%s"    // key for principal count
@@ -60,13 +60,22 @@ func (c PartitionStorageSet) String() string {
 	return result
 }
 
-type IndexPartitionMap map[uint16]uint16 // Maps vbuckets to index partition value
-type VbPositionMap map[uint16]uint64     // Map from vbucket to position within partition.  Stored as uint64 to avoid cast during arithmetic
+type IndexPartitionMap []uint16      // Maps vbuckets to index partition value
+type VbPositionMap map[uint16]uint64 // Map from vbucket to position within partition.  Stored as uint64 to avoid cast during arithmetic
 
 type IndexPartitions struct {
 	PartitionDefs  PartitionStorageSet      // Partition definitions, as stored in bucket _idxPartitionMap
 	VbMap          IndexPartitionMap        // Map from vbucket to partition
 	VbPositionMaps map[uint16]VbPositionMap // VBPositionMaps, keyed by partition
+}
+
+func (i IndexPartitions) PartitionCount() int {
+	return len(i.PartitionDefs)
+}
+
+// Returns the partition the vb is assigned to
+func (i *IndexPartitions) PartitionForVb(vbNo uint16) uint16 {
+	return i.VbMap[vbNo]
 }
 
 func NewIndexPartitions(partitions PartitionStorageSet) *IndexPartitions {
@@ -76,7 +85,7 @@ func NewIndexPartitions(partitions PartitionStorageSet) *IndexPartitions {
 	}
 	copy(indexPartitions.PartitionDefs, partitions)
 
-	indexPartitions.VbMap = make(map[uint16]uint16)
+	indexPartitions.VbMap = make([]uint16, 1024)
 	indexPartitions.VbPositionMaps = make(map[uint16]VbPositionMap)
 
 	for _, partition := range partitions {
@@ -90,22 +99,80 @@ func NewIndexPartitions(partitions PartitionStorageSet) *IndexPartitions {
 	return indexPartitions
 }
 
-// VbSequence supports collections of {vb, seq} without requiring a map.
-type VbSequence struct {
-	vbNo uint16
-	seq  uint64
+// Priority of a journal message
+type CompareResult int
+
+const (
+	CompareLessThan CompareResult = iota - 1
+	CompareEquals
+	CompareGreaterThan
+)
+
+// VbSeq stores a vbucket number and vbucket sequence pair
+type VbSeq struct {
+	Vb  uint16
+	Seq uint64
 }
 
-// ShardedClock maintains the collection of clock shards (ShardedClockPartitions), and also manages
-// the counter for the clock.
+// Updates to the other sequence value if empty (seq=0), or the other value compares less than v
+func (v *VbSeq) UpdateIfEarlier(other VbSeq) bool {
+	if v.Seq == 0 || CompareVbSequence(other, *v) == CompareLessThan {
+		v.Vb = other.Vb
+		v.Seq = other.Seq
+		return true
+	}
+	return false
+}
+
+func (v VbSeq) LessThanOrEqualsClock(clock SequenceClock) bool {
+	if v.Seq == 0 {
+		return false
+	}
+
+	if v.Seq <= clock.GetSequence(v.Vb) {
+		return true
+	}
+	return false
+
+}
+
+func (v VbSeq) CompareTo(vb uint16, seq uint64) CompareResult {
+	return CompareVbAndSequence(v.Vb, v.Seq, vb, seq)
+}
+
+// Compares based on vbno, then sequence.  Returns 0 if identical, 1 if s1 > s2, -1 if s1 < s2
+func CompareVbSequence(s1, s2 VbSeq) CompareResult {
+	return CompareVbAndSequence(s1.Vb, s1.Seq, s2.Vb, s2.Seq)
+}
+
+// Compares based on vbno, then sequence.  Returns 0 if identical, 1 if s1 > s2, -1 if s1 < s2
+func CompareVbAndSequence(vb1 uint16, s1 uint64, vb2 uint16, s2 uint64) CompareResult {
+	if vb1 < vb2 {
+		return -1
+	}
+	if vb1 > vb2 {
+		return 1
+	}
+	// Vbno equal, compare sequences
+	if s1 < s2 {
+		return -1
+	}
+	if s1 > s2 {
+		return 1
+	}
+	return 0
+}
+
+// ShardedClock is a full clock for the bucket.  ShardedClock manages the collection of clock shards (ShardedClockPartitions),
+// and also manages the counter for the clock.
 type ShardedClock struct {
-	baseKey       string                            // key prefix used to build keys for clock component docs
-	counter       uint64                            // count value for clock
-	countKey      string                            // key used to incr count value
-	partitionMap  *IndexPartitions                  // Index partition map
-	partitions    map[uint16]*ShardedClockPartition // Clock partitions - one doc written per partition
-	bucket        Bucket                            // Bucket used to store clocks
-	partitionKeys []string                          // Keys for all partitions.  Convenience to avoid rebuilding set from partitions
+	baseKey       string                   // key prefix used to build keys for clock component docs
+	counter       uint64                   // count value for clock to minimize clock reads
+	countKey      string                   // key used to incr count value
+	partitionMap  *IndexPartitions         // Index partition map
+	partitions    []*ShardedClockPartition // Clock partitions - one doc written per partition
+	bucket        Bucket                   // Bucket used to store clocks
+	partitionKeys []string                 // Keys for all partitions.  Convenience to avoid rebuilding set from partitions
 }
 
 func NewShardedClock(baseKey string, partitions *IndexPartitions, bucket Bucket) *ShardedClock {
@@ -119,7 +186,7 @@ func NewShardedClock(baseKey string, partitions *IndexPartitions, bucket Bucket)
 	// Initialize partitions
 	numPartitions := len(partitions.PartitionDefs)
 
-	clock.partitions = make(map[uint16]*ShardedClockPartition, numPartitions)
+	clock.partitions = make([]*ShardedClockPartition, numPartitions)
 	clock.partitionKeys = make([]string, numPartitions)
 
 	return clock
@@ -137,7 +204,7 @@ func NewShardedClockWithPartitions(baseKey string, partitions *IndexPartitions, 
 	// Initialize partitions
 	numPartitions := len(partitions.PartitionDefs)
 
-	clock.partitions = make(map[uint16]*ShardedClockPartition, numPartitions)
+	clock.partitions = make([]*ShardedClockPartition, numPartitions)
 	clock.partitionKeys = make([]string, numPartitions)
 
 	// Initialize empty clock partitions
@@ -215,22 +282,36 @@ func (s *ShardedClock) Load() (isChanged bool, err error) {
 	return true, nil
 }
 
-func (s *ShardedClock) UpdateAndWrite(updateClock SequenceClock) (err error) {
+func (s *ShardedClock) GetSequence(vbNo uint16) (vbSequence uint64) {
+	partitionNo := s.partitionMap.VbMap[vbNo]
+	clockPartition := s.partitions[partitionNo]
+	if clockPartition != nil {
+		return clockPartition.GetSequence(vbNo)
+	} else {
+		return 0
+	}
+}
+
+// Update and write a sharded clock with the specified values.
+func (s *ShardedClock) UpdateAndWrite(updates map[uint16]uint64) (err error) {
 
 	// Build set of sequence updates by partition
 	// Future optimization: have method accept sequences already grouped by partition - potentially
 	// in a clock implementation
-	partitionSequences := make(map[uint16][]VbSequence)
+	partitionSequences := make(map[uint16][]VbSeq)
 
-	for vb, sequence := range updateClock.Value() {
-		if sequence > 0 {
-			partitionNo := s.partitionMap.VbMap[uint16(vb)]
-			_, ok := partitionSequences[partitionNo]
-			if !ok {
-				partitionSequences[partitionNo] = make([]VbSequence, 0)
-			}
-			partitionSequences[partitionNo] = append(partitionSequences[partitionNo], VbSequence{vbNo: uint16(vb), seq: sequence})
+	for vb, sequence := range updates {
+		partitionNo := s.partitionMap.VbMap[uint16(vb)]
+		_, ok := partitionSequences[partitionNo]
+		if !ok {
+			partitionSequences[partitionNo] = make([]VbSeq, 0)
 		}
+		partitionSequences[partitionNo] = append(partitionSequences[partitionNo], VbSeq{Vb: uint16(vb), Seq: sequence})
+
+	}
+
+	if len(partitionSequences) == 0 {
+		return nil
 	}
 
 	var wg sync.WaitGroup
@@ -248,11 +329,11 @@ func (s *ShardedClock) UpdateAndWrite(updateClock SequenceClock) (err error) {
 
 		// Update partitions in parallel goroutines.
 		// Future optimization: implement a bulk set based version of WriteCasRaw
-		go func(p *ShardedClockPartition, seqs []VbSequence) {
+		go func(p *ShardedClockPartition, seqs []VbSeq) {
 			defer wg.Done()
 			// Apply sequences to clock partition
 			for _, vbSeq := range seqs {
-				p.SetSequence(vbSeq.vbNo, vbSeq.seq)
+				p.SetSequence(vbSeq.Vb, vbSeq.Seq)
 			}
 			value, err := p.Marshal()
 
@@ -266,7 +347,7 @@ func (s *ShardedClock) UpdateAndWrite(updateClock SequenceClock) (err error) {
 				}
 				// Reapply sequences to partition
 				for _, vbSeq := range seqs {
-					p.SetSequence(vbSeq.vbNo, vbSeq.seq)
+					p.SetSequence(vbSeq.Vb, vbSeq.Seq)
 				}
 				return p.Marshal()
 			})
@@ -280,6 +361,7 @@ func (s *ShardedClock) UpdateAndWrite(updateClock SequenceClock) (err error) {
 
 	}
 	wg.Wait()
+
 	// Increment the clock count
 	s.counter, err = s.bucket.Incr(s.countKey, 1, 1, 0)
 
@@ -373,7 +455,8 @@ func (p *ShardedClockPartition) Marshal() ([]byte, error) {
 }
 
 func (p *ShardedClockPartition) Unmarshal(value []byte) error {
-	p.value = value
+	p.value = make([]byte, len(value))
+	copy(p.value, value)
 	return nil
 }
 
@@ -566,7 +649,7 @@ func LoadClockCounter(baseKey string, bucket Bucket) (uint64, error) {
 }
 
 // Index partitions for unit tests
-func SeedTestPartitionMap(bucket Bucket, numPartitions uint16) error {
+func SeedTestPartitionMap(bucket Bucket, numPartitions uint16) (PartitionStorageSet, error) {
 	maxVbNo := uint16(1024)
 	partitionDefs := make(PartitionStorageSet, numPartitions)
 	vbPerPartition := maxVbNo / numPartitions
@@ -585,8 +668,8 @@ func SeedTestPartitionMap(bucket Bucket, numPartitions uint16) error {
 	// Persist to bucket
 	value, err := json.Marshal(partitionDefs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	bucket.SetRaw(KIndexPartitionKey, 0, value)
-	return nil
+	return partitionDefs, nil
 }

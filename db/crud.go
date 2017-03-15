@@ -196,7 +196,7 @@ func (db *Database) GetRevWithHistory(docid, revid string, maxHistory int, histo
 			}
 			ancestor := doc.History.findAncestorFromSet(revid, attachmentsSince)
 			if ancestor != "" {
-				minRevpos, _ = parseRevID(ancestor)
+				minRevpos, _ = ParseRevID(ancestor)
 				minRevpos++
 			}
 		}
@@ -416,7 +416,7 @@ func (db *Database) initializeSyncData(doc *document) (err error) {
 func (db *Database) Put(docid string, body Body) (string, error) {
 	// Get the revision ID to match, and the new generation number:
 	matchRev, _ := body["_rev"].(string)
-	generation, _ := parseRevID(matchRev)
+	generation, _ := ParseRevID(matchRev)
 	if generation < 0 {
 		return "", base.HTTPErrorf(http.StatusBadRequest, "Invalid revision ID")
 	}
@@ -439,7 +439,7 @@ func (db *Database) Put(docid string, body Body) (string, error) {
 				if !doc.History[matchRev].Deleted {
 					return nil, nil, base.HTTPErrorf(http.StatusConflict, "Document exists")
 				}
-				generation, _ = parseRevID(matchRev)
+				generation, _ = ParseRevID(matchRev)
 				generation++
 			}
 		} else if !doc.History.isLeaf(matchRev) {
@@ -465,7 +465,7 @@ func (db *Database) Put(docid string, body Body) (string, error) {
 // This is equivalent to the "new_edits":false mode of CouchDB.
 func (db *Database) PutExistingRev(docid string, body Body, docHistory []string) error {
 	newRev := docHistory[0]
-	generation, _ := parseRevID(newRev)
+	generation, _ := ParseRevID(newRev)
 	if generation < 0 {
 		return base.HTTPErrorf(http.StatusBadRequest, "Invalid revision ID")
 	}
@@ -736,9 +736,24 @@ func (db *Database) updateDoc(docid string, allowImport bool, expiry uint32, cal
 
 		// Return the new raw document value for the bucket to store.
 		raw, err = json.Marshal(doc)
-		base.LogTo("Cache", "SAVING #%d", doc.Sequence) //TEMP?
+		base.LogTo("CRUD+", "SAVING #%d", doc.Sequence) //TEMP?
 		return
 	})
+
+	// If the WriteUpdate didn't succeed, check whether there are unused, allocated sequences that need to be accounted for
+	if err != nil && db.writeSequences() {
+		if docSequence > 0 {
+			if seqErr := db.sequences.releaseSequence(docSequence); seqErr != nil {
+				base.Warn("Error returned when releasing sequence %d. Falling back to skipped sequence handling.  Error:%v", docSequence, seqErr)
+			}
+
+		}
+		for _, sequence := range unusedSequences {
+			if seqErr := db.sequences.releaseSequence(sequence); seqErr != nil {
+				base.Warn("Error returned when releasing sequence %d. Falling back to skipped sequence handling.  Error:%v", sequence, seqErr)
+			}
+		}
+	}
 
 	if err == couchbase.UpdateCancel {
 		return "", nil
@@ -986,9 +1001,19 @@ func (context *DatabaseContext) ComputeVbSequenceChannelsForPrincipal(princ auth
 	return channelSet, nil
 }
 
-// Recomputes the set of roles a User has been granted access to by sync() functions.
+// Recomputes the set of channels a User/Role has been granted access to by sync() functions.
 // This is part of the ChannelComputer interface defined by the Authenticator.
 func (context *DatabaseContext) ComputeRolesForUser(user auth.User) (channels.TimedSet, error) {
+	if context.UseGlobalSequence() {
+		return context.ComputeSequenceRolesForUser(user)
+	} else {
+		return context.ComputeVbSequenceRolesForUser(user)
+	}
+}
+
+// Recomputes the set of roles a User has been granted access to by sync() functions.
+// This is part of the ChannelComputer interface defined by the Authenticator.
+func (context *DatabaseContext) ComputeSequenceRolesForUser(user auth.User) (channels.TimedSet, error) {
 	var vres struct {
 		Rows []struct {
 			Value channels.TimedSet
@@ -1009,6 +1034,27 @@ func (context *DatabaseContext) ComputeRolesForUser(user auth.User) (channels.Ti
 		}
 	}
 	return result, nil
+}
+
+// Recomputes the set of channels a User/Role has been granted access to by sync() functions.
+// This is part of the ChannelComputer interface defined by the Authenticator.
+func (context *DatabaseContext) ComputeVbSequenceRolesForUser(user auth.User) (channels.TimedSet, error) {
+	var vres struct {
+		Rows []struct {
+			Value channels.TimedSet
+		}
+	}
+
+	opts := map[string]interface{}{"stale": false, "key": user.Name()}
+	if verr := context.Bucket.ViewCustom(DesignDocSyncGateway, ViewRoleAccessVbSeq, opts, &vres); verr != nil {
+		return nil, verr
+	}
+
+	roleSet := channels.TimedSet{}
+	for _, row := range vres.Rows {
+		roleSet.Add(row.Value)
+	}
+	return roleSet, nil
 }
 
 //////// REVS_DIFF:
@@ -1036,10 +1082,10 @@ func (db *Database) RevDiff(docid string, revids []string) (missing, possible []
 		if !revtree.contains(revid) {
 			missing = append(missing, revid)
 			// Look at the doc's leaves for a known possible ancestor:
-			if gen, _ := parseRevID(revid); gen > 1 {
+			if gen, _ := ParseRevID(revid); gen > 1 {
 				revtree.forEachLeaf(func(possible *RevInfo) {
 					if !revidsSet.Contains(possible.ID) {
-						possibleGen, _ := parseRevID(possible.ID)
+						possibleGen, _ := ParseRevID(possible.ID)
 						if possibleGen < gen && possibleGen >= gen-100 {
 							possibleSet[possible.ID] = true
 						} else if possibleGen == gen && possible.Parent != "" {

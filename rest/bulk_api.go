@@ -21,7 +21,21 @@ import (
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/channels"
 	"github.com/couchbase/sync_gateway/db"
+	"time"
 )
+
+var bulkApiBulkGetRollingMean = base.NewIntRollingMeanVar(100)
+var bulkApiBulkDocsRollingMean = base.NewIntRollingMeanVar(100)
+var bulkApiBulkGetPerDocRollingMean = base.NewIntRollingMeanVar(100)
+var bulkApiBulkDocsPerDocRollingMean = base.NewIntRollingMeanVar(100)
+
+func init() {
+	base.StatsExpvars.Set("bulkApi.BulkGetRollingMean", &bulkApiBulkGetRollingMean)
+	base.StatsExpvars.Set("bulkApi.BulkDocsRollingMean", &bulkApiBulkDocsRollingMean)
+	base.StatsExpvars.Set("bulkApi.BulkGetPerDocRollingMean", &bulkApiBulkGetPerDocRollingMean)
+	base.StatsExpvars.Set("bulkApi.BulkDocsPerDocRollingMean", &bulkApiBulkDocsPerDocRollingMean)
+}
+
 
 // HTTP handler for _all_docs
 func (h *handler) handleAllDocs() error {
@@ -294,6 +308,10 @@ func (h *handler) handleDumpChannel() error {
 // 	 ]
 // }
 func (h *handler) handleBulkGet() error {
+
+	handleBulkGetStartedAt := time.Now()
+	defer bulkApiBulkGetRollingMean.AddSince(handleBulkGetStartedAt)
+
 	includeAttachments := h.getBoolQuery("attachments")
 	showExp := h.getBoolQuery("show_exp")
 	revsLimit := 0
@@ -325,6 +343,9 @@ func (h *handler) handleBulkGet() error {
 		internalerr := base.HTTPErrorf(http.StatusBadRequest, "missing 'docs' property")
 		return internalerr
 	}
+
+	defer bulkApiBulkGetPerDocRollingMean.AddSincePerItem(handleBulkGetStartedAt, len(docs))
+
 
 	err = h.writeMultipart("mixed", func(writer *multipart.Writer) error {
 		for _, item := range docs {
@@ -380,6 +401,10 @@ func (h *handler) handleBulkGet() error {
 
 // HTTP handler for a POST to _bulk_docs
 func (h *handler) handleBulkDocs() error {
+
+	handleBulkDocsStartedAt := time.Now()
+	defer bulkApiBulkDocsRollingMean.AddSince(handleBulkDocsStartedAt)
+
 	body, err := h.readJSON()
 	if err != nil {
 		return err
@@ -395,6 +420,9 @@ func (h *handler) handleBulkDocs() error {
 		return err
 	}
 	lenDocs := len(userDocs)
+
+	defer bulkApiBulkDocsPerDocRollingMean.AddSincePerItem(handleBulkDocsStartedAt, len(userDocs))
+
 	// split out local docs, save them on their own
 	localDocs := make([]interface{}, 0, lenDocs)
 	docs := make([]interface{}, 0, lenDocs)

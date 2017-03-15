@@ -6,6 +6,7 @@ import (
 	"expvar"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -321,6 +322,12 @@ func (c *changeCache) DocChanged(docID string, docJSON []byte, seq uint64, vbNo 
 			return
 		}
 
+		// Is this an unused sequence notification?
+		if strings.HasPrefix(docID, UnusedSequenceKeyPrefix) {
+			c.processUnusedSequence(docID)
+			return
+		}
+
 		// First unmarshal the doc (just its metadata, to save time/memory):
 		doc, err := UnmarshalDocumentSyncData(docJSON, false)
 		if err != nil || !doc.HasValidSyncData(c.context.writeSequences()) {
@@ -350,6 +357,8 @@ func (c *changeCache) DocChanged(docID string, docJSON []byte, seq uint64, vbNo 
 		// If the recent sequence history includes any sequences earlier than the current sequence, and
 		// not already seen by the gateway (more recent than c.nextSequence), add them as empty entries
 		// so that they are included in sequence buffering.
+		// If one of these sequences represents a removal from a channel then set the LogEntry removed flag
+		// and the set of channels it was removed from
 		currentSequence := doc.Sequence
 		if len(doc.UnusedSequences) > 0 {
 			currentSequence = doc.UnusedSequences[0]
@@ -364,6 +373,15 @@ func (c *changeCache) DocChanged(docID string, docJSON []byte, seq uint64, vbNo 
 						Sequence:     seq,
 						TimeReceived: time.Now(),
 					}
+
+					//if the doc was removed from one or more channels at this sequence
+					// Set the removed flag and removed channel set on the LogEntry
+					if channelRemovals, atRevId := doc.Channels.ChannelsRemovedAtSequence(seq); len(channelRemovals) > 0 {
+						change.DocID = docID
+						change.RevID = atRevId
+						change.Channels = channelRemovals
+					}
+
 					c.processEntry(change)
 				}
 			}
@@ -396,6 +414,22 @@ func (c *changeCache) unmarshalPrincipal(docJSON []byte, isUser bool) (auth.Prin
 	} else {
 		return nil, fmt.Errorf("Attempt to unmarshal principal using closed bucket")
 	}
+}
+
+// Process unused sequence notification.  Extracts sequence from docID and sends to cache for buffering
+func (c *changeCache) processUnusedSequence(docID string) {
+	sequenceStr := strings.TrimPrefix(docID, UnusedSequenceKeyPrefix)
+	sequence, err := strconv.ParseUint(sequenceStr, 10, 64)
+	if err != nil {
+		base.Warn("Unable to identify sequence number for unused sequence notification with key: %s, error:", docID, err)
+		return
+	}
+	change := &LogEntry{
+		Sequence:     sequence,
+		TimeReceived: time.Now(),
+	}
+	base.LogTo("Cache", "Received #%d (unused sequence)", sequence)
+	c.processEntry(change)
 }
 
 func (c *changeCache) processPrincipalDoc(docID string, docJSON []byte, isUser bool) {
@@ -684,7 +718,11 @@ func (h *SkippedSequenceQueue) Remove(x uint64) error {
 
 	i := SearchSequenceQueue(*h, x)
 	if i < len(*h) && (*h)[i].seq == x {
-		*h = append((*h)[:i], (*h)[i+1:]...)
+		// GC-friendly removal of skipped sequence entries from the queue.
+		// (https://github.com/golang/go/wiki/SliceTricks)
+		copy((*h)[i:], (*h)[i+1:])
+		(*h)[len(*h)-1] = nil
+		*h = (*h)[:len(*h)-1]
 		return nil
 	} else {
 		return errors.New("Value not found")

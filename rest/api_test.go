@@ -73,7 +73,6 @@ func (rt *restTester) bucket() base.Bucket {
 		rt._sc = NewServerContext(&ServerConfig{
 			CORS:           corsConfig,
 			Facebook:       &FacebookConfig{},
-			Persona:        &PersonaConfig{},
 			AdminInterface: &DefaultAdminInterface,
 		})
 
@@ -112,7 +111,6 @@ func (rt *restTester) bucketAllowEmptyPassword() base.Bucket {
 	rt._sc = NewServerContext(&ServerConfig{
 		CORS:           &CORSConfig{},
 		Facebook:       &FacebookConfig{},
-		Persona:        &PersonaConfig{},
 		AdminInterface: &DefaultAdminInterface,
 	})
 
@@ -441,6 +439,31 @@ func TestDocAttachmentOnRemovedRev(t *testing.T) {
 	assertStatus(t, response, 404)
 }
 
+func TestDocumentUpdateWithNullBody(t *testing.T) {
+	var rt restTester
+
+	a := rt.ServerContext().Database("db").Authenticator()
+	user, err := a.GetUser("")
+	assert.Equals(t, err, nil)
+	user.SetDisabled(true)
+	err = a.Save(user)
+	assert.Equals(t, err, nil)
+
+	//Create a test user
+	user, err = a.NewUser("user1", "letmein", channels.SetOf("foo"))
+	a.Save(user)
+	//Create document
+	response := rt.send(requestByUser("PUT", "/db/doc", `{"prop":true, "channels":["foo"]}`, "user1"))
+	assertStatus(t, response, 201)
+	var body db.Body
+	json.Unmarshal(response.Body.Bytes(), &body)
+	revid := body["rev"].(string)
+
+	//Put new revision with null body
+	response = rt.send(requestByUser("PUT", "/db/doc?rev="+revid, "", "user1"))
+	assertStatus(t, response, 400)
+}
+
 func TestFunkyDocIDs(t *testing.T) {
 	var rt restTester
 	rt.createDoc(t, "AC%2FDC")
@@ -635,9 +658,6 @@ func TestCORSLoginOriginOnSessionPost(t *testing.T) {
 	response := rt.sendRequestWithHeaders("POST", "/db/_session", "{\"name\":\"jchris\",\"password\":\"secret\"}", reqHeaders)
 	assertStatus(t, response, 401)
 
-	response = rt.sendRequestWithHeaders("POST", "/db/_persona", `{"ok":true}`, reqHeaders)
-	assertStatus(t, response, 500)
-
 	response = rt.sendRequestWithHeaders("POST", "/db/_facebook", `{"access_token":"true"}`, reqHeaders)
 	assertStatus(t, response, 401)
 }
@@ -664,9 +684,6 @@ func TestNoCORSOriginOnSessionPost(t *testing.T) {
 	}
 
 	response := rt.sendRequestWithHeaders("POST", "/db/_session", "{\"name\":\"jchris\",\"password\":\"secret\"}", reqHeaders)
-	assertStatus(t, response, 400)
-
-	response = rt.sendRequestWithHeaders("POST", "/db/_persona", `{"ok":true}`, reqHeaders)
 	assertStatus(t, response, 400)
 
 	response = rt.sendRequestWithHeaders("POST", "/db/_facebook", `{"access_token":"true"}`, reqHeaders)
@@ -1487,7 +1504,7 @@ func TestChannelAccessChanges(t *testing.T) {
 	assertStatus(t, rt.send(request("PUT", "/db/epsilon", `{"owner":"waldo"}`)), 201)
 
 	// Wait for change caching to complete before running resync below
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	// Finally, throw a wrench in the works by changing the sync fn. Note that normally this wouldn't
 	// be changed while the database is in use (only when it's re-opened) but for testing purposes
@@ -2480,6 +2497,68 @@ func DisabledTestLongpollWithWildcard(t *testing.T) {
 	time.Sleep(1 * time.Second)
 	response = rt.send(request("PUT", "/db/sherlock", `{"channel":["PBS"]}`))
 	wg.Wait()
+}
+
+func TestUnsupportedConfig(t *testing.T) {
+
+	sc := NewServerContext(&ServerConfig{})
+	testProviderOnlyJSON := `{"name": "test_provider_only",
+        			"server": "walrus:",
+        			"bucket": "test_provider_only",
+			        "unsupported": {
+			          "oidc_test_provider": {
+			            "enabled":true,
+			            "unsigned_id_token":true
+			          }
+			        }
+      			   }`
+
+	var testProviderOnlyConfig DbConfig
+	err := json.Unmarshal([]byte(testProviderOnlyJSON), &testProviderOnlyConfig)
+	assert.True(t, err == nil)
+
+	_, err = sc.AddDatabaseFromConfig(&testProviderOnlyConfig)
+	assertNoError(t, err, "Error adding testProviderOnly database.")
+
+	viewsOnlyJSON := `{"name": "views_only",
+        			"server": "walrus:",
+        			"bucket": "views_only",
+			        "unsupported": {
+			          "user_views": {
+			            "enabled":true
+			          }
+			        }
+      			   }`
+
+	var viewsOnlyConfig DbConfig
+	err = json.Unmarshal([]byte(viewsOnlyJSON), &viewsOnlyConfig)
+	assert.True(t, err == nil)
+
+	_, err = sc.AddDatabaseFromConfig(&viewsOnlyConfig)
+	assertNoError(t, err, "Error adding viewsOnlyConfig database.")
+
+	viewsAndTestJSON := `{"name": "views_and_test",
+        			"server": "walrus:",
+        			"bucket": "views_and_test",
+			        "unsupported": {
+			          "oidc_test_provider": {
+			            "enabled":true,
+			            "unsigned_id_token":true
+			          },
+			          "user_views": {
+			            "enabled":true
+			          }
+			        }
+      			   }`
+
+	var viewsAndTestConfig DbConfig
+	err = json.Unmarshal([]byte(viewsAndTestJSON), &viewsAndTestConfig)
+	assert.True(t, err == nil)
+
+	_, err = sc.AddDatabaseFromConfig(&viewsAndTestConfig)
+	assertNoError(t, err, "Error adding viewsAndTestConfig database.")
+
+	sc.Close()
 }
 
 var prt restTester

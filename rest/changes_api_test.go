@@ -13,16 +13,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/couchbaselabs/go.assert"
 
 	"bytes"
+	"net/http"
+
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/channels"
 	"github.com/couchbase/sync_gateway/db"
-	"net/http"
 )
 
 type indexTester struct {
@@ -45,7 +48,6 @@ func initIndexTester(useBucketIndex bool, syncFn string) indexTester {
 
 	it._sc = NewServerContext(&ServerConfig{
 		Facebook: &FacebookConfig{},
-		Persona:  &PersonaConfig{},
 	})
 
 	var syncFnPtr *string
@@ -78,7 +80,6 @@ func initIndexTester(useBucketIndex bool, syncFn string) indexTester {
 				Server: &serverName,
 				Bucket: &indexBucketName,
 			},
-			IndexWriter: true,
 		}
 		dbConfig.ChannelIndex = channelIndexConfig
 	}
@@ -86,7 +87,7 @@ func initIndexTester(useBucketIndex bool, syncFn string) indexTester {
 	dbContext, err := it._sc.AddDatabaseFromConfig(dbConfig)
 
 	if useBucketIndex {
-		err := base.SeedTestPartitionMap(dbContext.GetIndexBucket(), 64)
+		_, err := base.SeedTestPartitionMap(dbContext.GetIndexBucket(), 64)
 		if err != nil {
 			panic(fmt.Sprintf("Error from seed partition map: %v", err))
 		}
@@ -219,6 +220,56 @@ func postChanges(t *testing.T, it indexTester) {
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	assert.Equals(t, len(changes.Results), 3)
+
+}
+
+// Tests race between waking up the changes feed, and detecting that the user doc has changed
+func TestPostChangesUserTiming(t *testing.T) {
+
+	it := initIndexTester(false, `function(doc) {channel(doc.channel); access(doc.accessUser, doc.accessChannel)}`)
+	defer it.Close()
+
+	response := it.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
+	assert.True(t, response != nil)
+
+	// Create user:
+	a := it.ServerContext().Database("db").Authenticator()
+	bernard, err := a.NewUser("bernard", "letmein", channels.SetOf("bernard"))
+	assert.True(t, err == nil)
+	a.Save(bernard)
+
+	var wg sync.WaitGroup
+
+	// Put several documents to channel PBS
+	response = it.sendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.sendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.sendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var changes struct {
+			Results  []db.ChangeEntry
+			Last_Seq string
+		}
+		changesJSON := `{"style":"all_docs", "timeout":6000, "feed":"longpoll", "limit":50, "since":"0"}`
+		changesResponse := it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+		// Validate that the user receives backfill plus the new doc
+		err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+		assertNoError(t, err, "Error unmarshalling changes response")
+		assert.Equals(t, len(changes.Results), 4)
+	}()
+
+	// Wait for changes feed to get into wait mode, even when running under race
+	time.Sleep(2 * time.Second)
+
+	// Put a doc in channel bernard, that also grants bernard access to channel PBS
+	response = it.sendAdminRequest("PUT", "/db/grant1", `{"value":1, "channel":["bernard"], "accessUser":"bernard", "accessChannel":"PBS"}`)
+	assertStatus(t, response, 201)
+	wg.Wait()
 
 }
 
@@ -548,6 +599,166 @@ func TestChangesLoopingWhenLowSequence(t *testing.T) {
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, len(changes.Results), 1)
+
+}
+
+func TestUnusedSequences(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		_testConcurrentDelete(t)
+		_testConcurrentPutAsDelete(t)
+		_testConcurrentUpdate(t)
+		_testConcurrentNewEditsFalseDelete(t)
+	}
+}
+
+func _testConcurrentDelete(t *testing.T) {
+	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+"})
+
+	rt := restTester{syncFn: `function(doc,oldDoc) {
+			 channel(doc.channel)
+		 }`}
+
+	// Create doc
+	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+	var body db.Body
+	json.Unmarshal(response.Body.Bytes(), &body)
+	assert.Equals(t, body["ok"], true)
+	revId := body["rev"].(string)
+
+	// Issue concurrent deletes
+	var wg sync.WaitGroup
+	for i := 1; i <= 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			deleteResponse := rt.sendAdminRequest("DELETE", fmt.Sprintf("/db/doc1?rev=%s", revId), "")
+			log.Printf("Delete #%d got response code: %d", i, deleteResponse.Code)
+		}(i)
+	}
+	wg.Wait()
+
+	// WaitForPendingChanges waits up to 2 seconds for all allocated sequences to be cached, panics on timeout
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+
+	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+
+	// Wait for writes to be processed and indexed
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+
+}
+
+func _testConcurrentPutAsDelete(t *testing.T) {
+	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+"})
+
+	rt := restTester{syncFn: `function(doc,oldDoc) {
+			 channel(doc.channel)
+		 }`}
+
+	// Create doc
+	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+	var body db.Body
+	json.Unmarshal(response.Body.Bytes(), &body)
+	assert.Equals(t, body["ok"], true)
+	revId := body["rev"].(string)
+
+	// Issue concurrent deletes
+	var wg sync.WaitGroup
+	for i := 1; i <= 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			deleteResponse := rt.sendAdminRequest("PUT", fmt.Sprintf("/db/doc1?rev=%s", revId), `{"_deleted":true}`)
+			log.Printf("Delete #%d got response code: %d", i, deleteResponse.Code)
+		}(i)
+	}
+	wg.Wait()
+
+	// WaitForPendingChanges waits up to 2 seconds for all allocated sequences to be cached, panics on timeout
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+
+	// Write another doc, to validate sequences restart
+	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+}
+
+func _testConcurrentUpdate(t *testing.T) {
+	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+"})
+
+	rt := restTester{syncFn: `function(doc,oldDoc) {
+			 channel(doc.channel)
+		 }`}
+
+	// Create doc
+	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+	var body db.Body
+	json.Unmarshal(response.Body.Bytes(), &body)
+	assert.Equals(t, body["ok"], true)
+	revId := body["rev"].(string)
+
+	// Issue concurrent updates
+	var wg sync.WaitGroup
+	for i := 1; i <= 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			updateResponse := rt.sendAdminRequest("PUT", fmt.Sprintf("/db/doc1?rev=%s", revId), `{"value":10}`)
+			log.Printf("Update #%d got response code: %d", i, updateResponse.Code)
+		}(i)
+	}
+	wg.Wait()
+
+	// WaitForPendingChanges waits up to 2 seconds for all allocated sequences to be cached, panics on timeout
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+
+	// Write another doc, to validate sequences restart
+	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+}
+
+func _testConcurrentNewEditsFalseDelete(t *testing.T) {
+	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+", "HTTP", "HTTP+"})
+
+	rt := restTester{syncFn: `function(doc,oldDoc) {
+			 channel(doc.channel)
+		 }`}
+
+	// Create doc
+	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+	var body db.Body
+	json.Unmarshal(response.Body.Bytes(), &body)
+	assert.Equals(t, body["ok"], true)
+	revId := body["rev"].(string)
+	revIdHash := strings.TrimPrefix(revId, "1-")
+
+	deleteRequestBody := fmt.Sprintf(`{"_rev": "2-foo", "_revisions": {"start": 2, "ids": ["foo", "%s"]}, "_deleted":true}`, revIdHash)
+	// Issue concurrent deletes
+	var wg sync.WaitGroup
+	for i := 1; i <= 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			deleteResponse := rt.sendAdminRequest("PUT", "/db/doc1?rev=2-foo&new_edits=false", deleteRequestBody)
+			log.Printf("Delete #%d got response code: %d", i, deleteResponse.Code)
+		}(i)
+	}
+	wg.Wait()
+
+	// WaitForPendingChanges waits up to 2 seconds for all allocated sequences to be cached, panics on timeout
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+
+	// Write another doc, to see where sequences are at
+	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	assertStatus(t, response, 201)
+	rt.ServerContext().Database("db").WaitForPendingChanges()
 
 }
 

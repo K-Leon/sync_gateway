@@ -158,8 +158,7 @@ func (bucket CouchbaseBucket) StartTapFeed(args sgbucket.TapArguments) (sgbucket
 	// Uses tap by default, unless DCP is explicitly specified
 	switch bucket.spec.FeedType {
 	case DcpFeedType:
-		Warn("DCP feed type disabled due to https://github.com/couchbase/sync_gateway/issues/1406.  Reverting to TAP mode")
-		return bucket.StartCouchbaseTapFeed(args)
+		return bucket.StartDCPFeed(args)
 
 	case DcpShardFeedType:
 
@@ -286,6 +285,8 @@ func (bucket CouchbaseBucket) StartDCPFeed(args sgbucket.TapArguments) (sgbucket
 	return &dcpFeed, nil
 }
 
+// Goes out to the bucket and gets the high sequence number for all vbuckets and returns
+// a map of UUIDS and a map of high sequence numbers (map from vbno -> seq)
 func (bucket CouchbaseBucket) GetStatsVbSeqno(maxVbno uint16, useAbsHighSeqNo bool) (uuids map[uint16]uint64, highSeqnos map[uint16]uint64, seqErr error) {
 
 	stats := bucket.Bucket.GetStats("vbucket-seqno")
@@ -377,8 +378,6 @@ func (bucket CouchbaseBucket) CBSVersion() (major uint64, minor uint64, micro st
 
 	micro = arr[2]
 
-	LogTo("CRUD+", "major = %i, minor = %i, micro = %s", major, minor, micro)
-
 	return
 }
 
@@ -440,10 +439,45 @@ func GetBucket(spec BucketSpec, callback sgbucket.BucketNotifyFn) (bucket Bucket
 
 	}
 
-	if LogKeys["Bucket"] {
+	if LogEnabledExcludingLogStar("Bucket") {
 		bucket = &LoggingBucket{bucket: bucket}
 	}
 	return
+}
+
+func WriteCasJSON(bucket Bucket, key string, value interface{}, cas uint64, exp int, callback func(v interface{}) (interface{}, error)) (casOut uint64, err error) {
+
+	// If there's an incoming value, attempt to write with that first
+	if value != nil {
+		casOut, err := bucket.WriteCas(key, 0, exp, cas, value, 0)
+		if err == nil {
+			return casOut, nil
+		}
+	}
+
+	for {
+		var currentValue interface{}
+		cas, err := bucket.Get(key, &currentValue)
+		if err != nil {
+			Warn("WriteCasJSON got error when calling Get:", err)
+			return 0, err
+		}
+		updatedValue, err := callback(currentValue)
+		if err != nil {
+			Warn("WriteCasJSON got error when calling callback:", err)
+			return 0, err
+		}
+		if updatedValue == nil {
+			// callback returned empty value - cancel write
+			return cas, nil
+		}
+		casOut, err := bucket.WriteCas(key, 0, exp, cas, updatedValue, 0)
+		if err != nil {
+			// CAS failure - reload block for another try
+		} else {
+			return casOut, nil
+		}
+	}
 }
 
 func WriteCasRaw(bucket Bucket, key string, value []byte, cas uint64, exp int, callback func([]byte) ([]byte, error)) (casOut uint64, err error) {
@@ -478,4 +512,52 @@ func WriteCasRaw(bucket Bucket, key string, value []byte, cas uint64, exp int, c
 			return casOut, nil
 		}
 	}
+}
+
+func IsKeyNotFoundError(bucket Bucket, err error) bool {
+
+	if err == nil {
+		return false
+	}
+
+	switch bucket.(type) {
+	case CouchbaseBucket:
+		if strings.Contains(err.Error(), "Not found") {
+			return true
+		}
+	case CouchbaseBucketGoCB:
+		if GoCBErrorType(err) == GoCBErr_MemdStatusKeyNotFound {
+			return true
+		}
+	default:
+		if _, ok := err.(sgbucket.MissingError); ok {
+			return true
+		}
+	}
+
+	return false
+
+}
+
+func IsCasMismatch(bucket Bucket, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	switch bucket.(type) {
+	case CouchbaseBucket:
+		if strings.Contains(err.Error(), "CAS mismatch") {
+			return true
+		}
+	case CouchbaseBucketGoCB:
+		if GoCBErrorType(err) == GoCBErr_MemdStatusKeyExists {
+			return true
+		}
+	default:
+		if strings.Contains(err.Error(), "CAS mismatch") {
+			return true
+		}
+	}
+
+	return false
 }

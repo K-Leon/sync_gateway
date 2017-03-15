@@ -1,10 +1,9 @@
 package db
 
 import (
+	"math"
 	"strings"
 	"sync"
-
-	"math"
 
 	sgbucket "github.com/couchbase/sg-bucket"
 	"github.com/couchbase/sync_gateway/auth"
@@ -16,6 +15,7 @@ import (
 // changes.
 type changeListener struct {
 	bucket                base.Bucket
+	bucketName            string                 // Used for logging
 	tapFeed               base.TapFeed           // Observes changes to bucket
 	tapNotifier           *sync.Cond             // Posts notifications when documents are updated
 	TapArgs               sgbucket.TapArguments  // The Tap Args (backfill, etc)
@@ -28,9 +28,18 @@ type changeListener struct {
 
 type DocChangedFunc func(docID string, jsonData []byte, seq uint64, vbNo uint16)
 
+func (listener *changeListener) Init(name string) {
+	listener.bucketName = name
+	listener.counter = 1
+	listener.terminateCheckCounter = 0
+	listener.keyCounts = map[string]uint64{}
+	listener.tapNotifier = sync.NewCond(&sync.Mutex{})
+}
+
 // Starts a changeListener on a given Bucket.
 func (listener *changeListener) Start(bucket base.Bucket, trackDocs bool, notify sgbucket.BucketNotifyFn) error {
 	listener.bucket = bucket
+	listener.bucketName = bucket.GetName()
 	listener.TapArgs = sgbucket.TapArguments{
 		Backfill: sgbucket.TapNoBackfill,
 		Notify:   notify,
@@ -41,10 +50,6 @@ func (listener *changeListener) Start(bucket base.Bucket, trackDocs bool, notify
 	}
 
 	listener.tapFeed = tapFeed
-	listener.counter = 1
-	listener.terminateCheckCounter = 0
-	listener.keyCounts = map[string]uint64{}
-	listener.tapNotifier = sync.NewCond(&sync.Mutex{})
 	if trackDocs {
 		listener.DocChannel = make(chan sgbucket.TapEvent, 100)
 	}
@@ -66,7 +71,11 @@ func (listener *changeListener) Start(bucket base.Bucket, trackDocs bool, notify
 						listener.OnDocChanged(key, event.Value, event.Sequence, event.VbNo)
 					}
 					listener.Notify(base.SetOf(key))
-				} else if !strings.HasPrefix(key, KSyncKeyPrefix) && !strings.HasPrefix(key, kIndexPrefix) {
+				} else if strings.HasPrefix(key, UnusedSequenceKeyPrefix) {
+					if listener.OnDocChanged != nil {
+						listener.OnDocChanged(key, event.Value, event.Sequence, event.VbNo)
+					}
+				} else if !strings.HasPrefix(key, KSyncKeyPrefix) && !strings.HasPrefix(key, base.KIndexPrefix) {
 					if listener.OnDocChanged != nil {
 						listener.OnDocChanged(key, event.Value, event.Sequence, event.VbNo)
 					}
@@ -106,7 +115,7 @@ func (listener *changeListener) Notify(keys base.Set) {
 		listener.keyCounts[key] = listener.counter
 	}
 	base.LogTo("Changes+", "Notifying that %q changed (keys=%q) count=%d",
-		listener.bucket.GetName(), keys, listener.counter)
+		listener.bucketName, keys, listener.counter)
 	listener.tapNotifier.Broadcast()
 	listener.tapNotifier.L.Unlock()
 }
@@ -145,7 +154,7 @@ func (listener *changeListener) Wait(keys []string, counter uint64, terminateChe
 	listener.tapNotifier.L.Lock()
 	defer listener.tapNotifier.L.Unlock()
 	base.LogTo("Changes+", "Waiting for %q's count to pass %d",
-		listener.bucket.GetName(), counter)
+		listener.bucketName, counter)
 	for {
 		curCounter := listener._currentCount(keys)
 
@@ -183,6 +192,7 @@ type changeWaiter struct {
 	userKeys                  []string
 	lastCounter               uint64
 	lastTerminateCheckCounter uint64
+	lastUserCount             uint64
 }
 
 // Creates a new changeWaiter that will wait for changes for the given document keys.
@@ -210,6 +220,9 @@ func (listener *changeListener) NewWaiterWithChannels(chans base.Set, user auth.
 	}
 	waiter := listener.NewWaiter(waitKeys)
 	waiter.userKeys = userKeys
+	if userKeys != nil {
+		waiter.lastUserCount = listener.CurrentCount(userKeys)
+	}
 	return waiter
 }
 
@@ -219,6 +232,9 @@ func (waiter *changeWaiter) Wait() uint32 {
 	lastTerminateCheckCounter := waiter.lastTerminateCheckCounter
 	lastCounter := waiter.lastCounter
 	waiter.lastCounter, waiter.lastTerminateCheckCounter = waiter.listener.Wait(waiter.keys, waiter.lastCounter, waiter.lastTerminateCheckCounter)
+	if waiter.userKeys != nil {
+		waiter.lastUserCount = waiter.listener.CurrentCount(waiter.userKeys)
+	}
 	countChanged := waiter.lastCounter > lastCounter
 
 	//Uses != to compare as value can cycle back through 0
@@ -236,10 +252,7 @@ func (waiter *changeWaiter) Wait() uint32 {
 // Returns the current counter value for the waiter's user (and roles).
 // If this value changes, it means the user or roles have been updated.
 func (waiter *changeWaiter) CurrentUserCount() uint64 {
-	if waiter.userKeys == nil {
-		return 0
-	}
-	return waiter.listener.CurrentCount(waiter.userKeys)
+	return waiter.lastUserCount
 }
 
 // Updates the set of channel keys in the ChangeWaiter (maintains the existing set of user keys)

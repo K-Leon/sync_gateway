@@ -19,12 +19,16 @@ type program struct {
 }
 
 func (p *program) Start(s service.Service) error {
-	go p.run()
+	err := p.startup()
+	if err != nil {
+		return err
+	}
+	go p.wait()
 	return nil
 }
 
-func (p *program) run() {
-	logger.Infof("Starting the Sync Gateway Accelerator Accelerator service using command: `%s %s`", p.ExePath, p.ConfigPath)
+func (p *program) startup() error {
+	logger.Infof("Starting the Sync Gateway Accelerator service using command: `%s %s`", p.ExePath, p.ConfigPath)
 
 	if p.ConfigPath != "" {
 		p.SGAccel = exec.Command(p.ExePath, p.ConfigPath)
@@ -36,7 +40,7 @@ func (p *program) run() {
 	f, err := os.OpenFile(stderrPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0777)
 	if err != nil {
 		logger.Warningf("Failed to open std err %q: %v", stderrPath, err)
-		return
+		return err
 	}
 	defer f.Close()
 	p.SGAccel.Stderr = f
@@ -44,17 +48,21 @@ func (p *program) run() {
 	err = p.SGAccel.Start()
 	if err != nil {
 		logger.Errorf("Failed to start Sync Gateway Accelerator due to error %v", err)
-		return
+		return err
 	}
-	err = p.SGAccel.Wait()
+	return nil
+}
+
+func (p *program) wait() {
+	err := p.SGAccel.Wait()
 	if err != nil {
 		logger.Errorf("Sync Gateway Accelerator exiting with %v", err)
-		panic("Failed to start Sync Gateway Accelerator service.")
 	}
+	panic("Couchbase Sync Gateway Accelerator service exited.")
 }
 
 func (p *program) Stop(s service.Service) error {
-	logger.Infof("Stopping Sync Gateway Accelerator Accelerator service...")
+	logger.Infof("Stopping Sync Gateway Accelerator service...")
 	p.SGAccel.Process.Kill()
 	return nil
 }
@@ -62,8 +70,8 @@ func (p *program) Stop(s service.Service) error {
 func main() {
 	svcConfig := &service.Config{
 		Name:        "SGAccel",
-		DisplayName: "Couchbase Sync Gateway Accelerator Accelerator",
-		Description: "Couchbase Sync Gateway Accelerator Accelerator performance and scalability service.",
+		DisplayName: "Couchbase Sync Gateway Accelerator",
+		Description: "Couchbase Sync Gateway Accelerator performance and scalability service.",
 	}
 
 	var exePath string

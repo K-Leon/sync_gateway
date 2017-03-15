@@ -75,7 +75,7 @@ def create_option_parser():
                       help=optparse.SUPPRESS_HELP)
     parser.add_option("--upload-host", dest="upload_host",
                       help="if specified, gathers diagnotics and uploads it to the specified host,"
-                           " e.g 's3.amazonaws.com/cb-customers'")
+                           " e.g 'https://s3.amazonaws.com/cb-customers'")
     parser.add_option("--customer", dest="upload_customer",
                       help="used in conjunction with '--upload-host' and '--ticket', "
                            "specifies the customer name for the upload")
@@ -83,7 +83,8 @@ def create_option_parser():
                       help="used in conjunction with '--upload-host' and '--customer',"
                            " specifies the support ticket number for the upload."
                            " e.g 1234 (must be numeric), contact Couchbase Support to open a new"
-                           "ticket if you do not already have one.")
+                           "ticket if you do not already have one.  For more info, see"
+                           "http://www.couchbase.com/wiki/display/couchbase/Working+with+the+Couchbase+Technical+Support+Team")
     parser.add_option("--sync-gateway-url", dest="sync_gateway_url",
                       help="Sync Gateway admin port URL, eg, http://localhost:4985")
     parser.add_option("--sync-gateway-config", dest="sync_gateway_config",
@@ -203,6 +204,21 @@ def extract_element_from_config(element, config):
         # If we can't deserialise the json or find the key then return nothing
         return
 
+def extract_element_from_default_logging_config(element, config):
+    # extracts a property from nested logging object
+        try:
+            logging_config = extract_element_from_config('Logging', config)
+            if logging_config:
+                default_logging_config = extract_element_from_config('default', json.dumps(logging_config))
+                if default_logging_config:
+                    guessed_log_path = extract_element_from_config('LogFilePath', json.dumps(default_logging_config))
+                    if guessed_log_path:
+                        return guessed_log_path
+            return
+        except (ValueError, KeyError):
+            # If we can't deserialise the json or find the key then return nothing
+            return
+
 def make_collect_logs_tasks(zip_dir, sg_url):
 
     sg_log_files = {
@@ -230,6 +246,7 @@ def make_collect_logs_tasks(zip_dir, sg_url):
     else:
         config_str = str(response.read())
 
+    # Find log file path from old style top level config
     guessed_log_path = extract_element_from_config('LogFilePath', config_str)
     if guessed_log_path:
         sg_log_files["sync_gateway_error.log"] = guessed_log_path
@@ -240,6 +257,28 @@ def make_collect_logs_tasks(zip_dir, sg_url):
         for os_home_dir in os_home_dirs:
             sg_log_file_path = os.path.join(os_home_dir, path)
             task = add_file_task(sourcefile_path=sg_log_file_path)
+            sg_tasks.append(task)
+
+
+    # Find log file path from new style logging config
+    guessed_logging_path = extract_element_from_default_logging_config('LogFilePath', config_str)
+    if guessed_logging_path:
+        # Get the parent directory and the log file name
+        log_file_parent_dir = os.path.abspath(os.path.join(guessed_logging_path, os.pardir))
+        log_file_name = os.path.basename(guessed_logging_path)
+        name, ext = os.path.splitext(log_file_name)
+
+        # iterate over all log files, including those with a timestamp prefix
+        log_file_pattern = "{}*{}".format(name, ext)
+        rotated_logs_pattern = os.path.join(
+           log_file_parent_dir,
+           log_file_pattern
+        )
+
+        for log_file_item_name in glob.iglob(rotated_logs_pattern):
+            log_file_item_path = os.path.join(log_file_parent_dir,log_file_item_name)
+            print('Capturing rotated log file {}'.format(log_file_item_path))
+            task = add_file_task(sourcefile_path=log_file_item_path)
             sg_tasks.append(task)
 
     return sg_tasks
@@ -448,6 +487,30 @@ def make_sg_tasks(zip_dir, sg_url, sync_gateway_config_path_option, sync_gateway
     
     return sg_tasks
 
+def discover_sg_binary_path(options, sg_url):
+
+    sg_bin_dirs = [
+        "/opt/couchbase-sync-gateway/bin/sync_gateway",            # Linux + OSX
+        "/opt/couchbase-sg-accel/bin/sg_accel",                    # Linux + OSX
+        R'C:\Program Files (x86)\Couchbase\sync_gateway.exe',      # Windows
+        R'C:\Program Files (x86)\Couchbase\sg_accel.exe',          # Windows
+    ]
+
+    for sg_binary_path_candidate in sg_bin_dirs:
+        if os.path.exists(sg_binary_path_candidate):
+            return sg_binary_path_candidate
+
+
+    sg_binary_path, _ = get_paths_from_expvars(sg_url)
+
+    if options.sync_gateway_executable is not None and len(options.sync_gateway_executable) > 0:
+        if not os.path.exists(options.sync_gateway_executable):
+            raise Exception(
+                "Path to sync gateway executable passed in does not exist: {}".format(options.sync_gateway_executable))
+        return sg_binary_path
+
+    # fallback to whatever was specified in options
+    return options.sync_gateway_executable
 
 def main():
 
@@ -538,13 +601,8 @@ def main():
     if options.verbosity:
         log("Python version: %s" % sys.version)
 
-    # Collect the SG binary
-    sg_binary_path, _ = get_paths_from_expvars(sg_url)
-
-    if options.sync_gateway_executable is not None and len(options.sync_gateway_executable) > 0:
-        if not os.path.exists(options.sync_gateway_executable):
-            raise Exception("Path to sync gateway executable passed in does not exist: {}".format(options.sync_gateway_executable))
-        sg_binary_path = options.sync_gateway_executable
+    # Find path to sg binary
+    sg_binary_path = discover_sg_binary_path(options, sg_url)
 
     # Run SG specific tasks
     for task in make_sg_tasks(zip_dir, sg_url, options.sync_gateway_config, options.sync_gateway_executable):

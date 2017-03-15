@@ -55,6 +55,12 @@ var kNotFoundError = base.HTTPErrorf(http.StatusNotFound, "missing")
 var kBadMethodError = base.HTTPErrorf(http.StatusMethodNotAllowed, "Method Not Allowed")
 var kBadRequestError = base.HTTPErrorf(http.StatusMethodNotAllowed, "Bad Request")
 
+var checkAuthRollingMean = base.NewIntRollingMeanVar(100)
+
+func init() {
+	base.StatsExpvars.Set("handler.CheckAuthRollingMean", &checkAuthRollingMean)
+}
+
 // Encapsulates the state of handling an HTTP request.
 type handler struct {
 	server         *ServerContext
@@ -122,7 +128,7 @@ func (h *handler) invoke(method handlerMethod) error {
 	base.StatsExpvars.Add("requests_total", 1)
 	base.StatsExpvars.Add("requests_active", 1)
 	defer base.StatsExpvars.Add("requests_active", -1)
-	
+
 	var err error
 	if h.server.config.CompressResponses == nil || *h.server.config.CompressResponses {
 		if encoded := NewEncodedResponseWriter(h.response, h.rq); encoded != nil {
@@ -189,12 +195,27 @@ func (h *handler) invoke(method handlerMethod) error {
 
 	h.logRequestLine()
 
+	if base.EnableLogHTTPBodies {
+		h.logRequestBody()
+	}
+
 	// Now set the request's Database (i.e. context + user)
 	if dbContext != nil {
 		h.db, err = db.GetDatabase(dbContext, h.user)
 		if err != nil {
 			return err
 		}
+	}
+
+	if base.EnableLogHTTPBodies {
+		// Wrap the existing ResponseWriter with one that "Tees" the output
+		// to stdout as well as writing back to the socket
+		h.response = NewLoggerTeeResponseWriter(
+			h.response,
+			"HTTP",
+			h.serialNumber,
+			h.rq,
+		)
 	}
 
 	return method(h) // Call the actual handler code
@@ -215,30 +236,26 @@ func (h *handler) logRequestLine() {
 		proto = " HTTP/2"
 	}
 
-	base.LogTo("HTTP", " #%03d: %s %s%s%s", h.serialNumber, h.rq.Method, sanitizeRequestURL(h.rq.URL), proto, as)
+	base.LogTo("HTTP", " #%03d: %s %s%s%s", h.serialNumber, h.rq.Method, base.SanitizeRequestURL(h.rq.URL), proto, as)
 }
 
-// Replaces sensitive data from the URL query string with ******.
-// Have to use string replacement instead of writing directly to the Values URL object, as only the URL's raw query is mutable.
-func sanitizeRequestURL(requestURL *url.URL) string {
-	urlString := requestURL.String()
-	// Do a basic contains for the values we care about, to minimize performance impact on other requests.
-	if strings.Contains(urlString, "code=") || strings.Contains(urlString, "token=") {
-		// Iterate over the URL values looking for matches, and then do a string replacement of the found value
-		// into urlString.  Need to unescapte the urlString, as the values returned by URL.Query() get unescaped.
-		urlString, _ = url.QueryUnescape(urlString)
-		values := requestURL.Query()
-		for key, vals := range values {
-			if key == "code" || strings.Contains(key, "token") {
-				//In case there are multiple entries
-				for _, val := range vals {
-					urlString = strings.Replace(urlString, fmt.Sprintf("%s=%s", key, val), fmt.Sprintf("%s=******", key), -1)
-				}
-			}
-		}
+func (h *handler) logRequestBody() {
+
+	if !base.EnableLogHTTPBodies {
+		return
 	}
 
-	return urlString
+	// Replace the requestBody io.ReadCloser with a TeeReadCloser that
+	// tees the request body to the base.Log with the HTTPBody logging key
+	h.requestBody = NewTeeReadCloser(
+		h.requestBody,
+		base.NewLoggerWriter(
+			"HTTP",
+			h.serialNumber,
+			h.rq,
+		),
+	)
+
 }
 
 func (h *handler) logDuration(realTime bool) {
@@ -275,11 +292,13 @@ func (h *handler) checkAuth(context *db.DatabaseContext) error {
 		return nil
 	}
 
+	defer checkAuthRollingMean.AddSince(time.Now())
+
 	var err error
 	// If oidc enabled, check for bearer ID token
 	if context.Options.OIDCOptions != nil {
 		if token := h.getBearerToken(); token != "" {
-			h.user, _, err = context.Authenticator().AuthenticateJWT(token, context.OIDCProviders, h.getOIDCCallbackURL)
+			h.user, _, err = context.Authenticator().AuthenticateUntrustedJWT(token, context.OIDCProviders, h.getOIDCCallbackURL)
 			if h.user == nil || err != nil {
 				return base.HTTPErrorf(http.StatusUnauthorized, "Invalid login")
 			}
@@ -293,7 +312,7 @@ func (h *handler) checkAuth(context *db.DatabaseContext) error {
 		* then authorize this request
 		 */
 		if unsupportedOptions := context.Options.UnsupportedOptions; unsupportedOptions != nil {
-			if unsupportedOptions.EnableOidcTestProvider && strings.HasSuffix(h.rq.URL.Path, "/_oidc_testing/token") {
+			if unsupportedOptions.OidcTestProvider.Enabled && strings.HasSuffix(h.rq.URL.Path, "/_oidc_testing/token") {
 				if username, password := h.getBasicAuth(); username != "" && password != "" {
 					provider := context.Options.OIDCOptions.Providers.GetProviderForIssuer(issuerUrlForDB(h, context.Name), testProviderAudiences)
 					if provider != nil && provider.ClientID != nil && provider.ValidationKey != nil {

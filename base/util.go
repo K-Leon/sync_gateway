@@ -13,17 +13,18 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -187,22 +188,6 @@ func CouchbaseUrlWithAuth(serverUrl, username, password, bucketname string) (str
 // Callback function to return the stable sequence
 type StableSequenceFunc func() (clock SequenceClock, err error)
 
-func LoadStableSequence(bucket Bucket) SequenceClock {
-	stableSequence := NewSequenceClockImpl()
-	value, cas, err := bucket.GetRaw(KStableSequenceKey)
-	if err != nil {
-		Warn("Stable sequence not found in index - resetting to 0.  Err: %v.  Bucket: %+v", err, bucket)
-		return stableSequence
-	}
-	stableSequence.Unmarshal(value)
-	stableSequence.SetCas(cas)
-	return stableSequence
-}
-
-func StableCallbackTest(callback StableSequenceFunc) (SequenceClock, error) {
-	return callback()
-}
-
 // This transforms raw input bucket credentials (for example, from config), to input
 // credentials expected by Couchbase server, based on a few rules
 func TransformBucketCredentials(inputUsername, inputPassword, inputBucketname string) (username, password, bucketname string) {
@@ -234,26 +219,6 @@ func IsPowerOfTwo(n uint16) bool {
 	return (n & (n - 1)) == 0
 }
 
-// IntMax is an expvar.Value that tracks the maximum value it's given.
-type IntMax struct {
-	i  int64
-	mu sync.RWMutex
-}
-
-func (v *IntMax) String() string {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return strconv.FormatInt(v.i, 10)
-}
-
-func (v *IntMax) SetIfMax(value int64) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if value > v.i {
-		v.i = value
-	}
-}
-
 // This is how Couchbase Server handles document expiration times
 //
 //The actual value sent may either be
@@ -272,6 +237,12 @@ func DurationToCbsExpiry(ttl time.Duration) int {
 	} else {
 		return int(time.Now().Add(ttl).Unix())
 	}
+}
+
+//This function takes a ttl in seconds and returns an int
+//formatted as required by CBS expiry processing
+func SecondsToCbsExpiry(ttl int) int {
+	return DurationToCbsExpiry(time.Duration(ttl) * time.Second)
 }
 
 //This function takes a CBS expiry and returns as a time
@@ -430,4 +401,106 @@ func ValueToStringArray(value interface{}) []string {
 	default:
 		return nil
 	}
+}
+
+// Validates path argument is a path to a writable file
+func IsFilePathWritable(fp string) (bool, error) {
+	//Get the containing directory for the file
+	containingDir := filepath.Dir(fp)
+
+	//Check that containing dir exists
+	_, err := os.Stat(containingDir)
+	if err != nil {
+		return false, err
+	}
+
+	//Check that the filePath points to a file not a directory
+	fi, err := os.Stat(fp)
+	if err == nil || !os.IsNotExist(err) {
+		Warn("filePath exists")
+		if fi.Mode().IsDir() {
+			err = errors.New("filePath is a directory")
+			return false, err
+		}
+	}
+
+	//Now validate that the logfile is writable
+	file, err := os.OpenFile(fp, os.O_WRONLY, 0666)
+	defer file.Close()
+	if err == nil {
+		return true, nil
+	}
+	if os.IsPermission(err) {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// Replaces sensitive data from the URL query string with ******.
+// Have to use string replacement instead of writing directly to the Values URL object, as only the URL's raw query is mutable.
+func SanitizeRequestURL(requestURL *url.URL) string {
+	urlString := requestURL.String()
+	// Do a basic contains for the values we care about, to minimize performance impact on other requests.
+	if strings.Contains(urlString, "code=") || strings.Contains(urlString, "token=") {
+		// Iterate over the URL values looking for matches, and then do a string replacement of the found value
+		// into urlString.  Need to unescapte the urlString, as the values returned by URL.Query() get unescaped.
+		urlString, _ = url.QueryUnescape(urlString)
+		values := requestURL.Query()
+		for key, vals := range values {
+			if key == "code" || strings.Contains(key, "token") {
+				//In case there are multiple entries
+				for _, val := range vals {
+					urlString = strings.Replace(urlString, fmt.Sprintf("%s=%s", key, val), fmt.Sprintf("%s=******", key), -1)
+				}
+			}
+		}
+	}
+
+	return urlString
+}
+
+// Convert a map of vbno->seq high sequences (as returned by couchbasebucket.GetStatsVbSeqno()) to a SequenceClock
+func HighSeqNosToSequenceClock(highSeqs map[uint16]uint64) (*SequenceClockImpl, error) {
+
+	seqClock := NewSequenceClockImpl()
+	for vbNo, vbSequence := range highSeqs {
+		seqClock.SetSequence(vbNo, vbSequence)
+	}
+
+	return seqClock, nil
+
+}
+
+// Make sure that the index bucket and data bucket have correct sequence parity
+// https://github.com/couchbase/sync_gateway/issues/1133
+func VerifyBucketSequenceParity(indexBucketStableClock SequenceClock, bucket Bucket) error {
+
+	cbBucket, ok := bucket.(CouchbaseBucket)
+	if !ok {
+		Warn(fmt.Sprintf("Bucket is a %T not a base.CouchbaseBucket, skipping verifyBucketSequenceParity()\n", bucket))
+		return nil
+	}
+
+	maxVbNo, err := cbBucket.GetMaxVbno()
+	if err != nil {
+		return err
+	}
+	_, highSeqnos, err := cbBucket.GetStatsVbSeqno(maxVbNo, false)
+	if err != nil {
+		return err
+	}
+	dataBucketClock, err := HighSeqNosToSequenceClock(highSeqnos)
+	if err != nil {
+		return err
+	}
+
+	// The index bucket stable clock should be before or equal to the data bucket clock,
+	// otherwise it could indicate that the data bucket has been _reset_ to empty or to
+	// a value, which would render the index bucket incorrect
+	if !indexBucketStableClock.AllBefore(dataBucketClock) {
+		return fmt.Errorf("IndexBucketStable clock is not AllBefore the data bucket clock")
+	}
+
+	return nil
 }

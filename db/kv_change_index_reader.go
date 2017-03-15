@@ -11,6 +11,7 @@ package db
 
 import (
 	"errors"
+	"expvar"
 	"fmt"
 	"strings"
 	"sync"
@@ -18,6 +19,17 @@ import (
 
 	"github.com/couchbase/sync_gateway/base"
 )
+
+var indexReaderOneShotCount expvar.Int
+var indexReaderPersistentCount expvar.Int
+var indexReaderPollReadersCount = base.NewIntRollingMeanVar(100)
+var indexReaderPollReadersTime = base.NewIntRollingMeanVar(100)
+var indexReaderPollPrincipalsCount = base.NewIntRollingMeanVar(100)
+var indexReaderPollPrincipalsTime = base.NewIntRollingMeanVar(100)
+var indexReaderGetChangesTime = base.NewIntRollingMeanVar(100)
+var indexReaderGetChangesCount expvar.Int
+var indexReaderGetChangesUseCached expvar.Int
+var indexReaderGetChangesUseIndexed expvar.Int
 
 type kvChangeIndexReader struct {
 	indexReadBucket           base.Bucket                // Index bucket
@@ -33,10 +45,22 @@ type kvChangeIndexReader struct {
 	overallPrincipalCount     uint64                     // Counter for all principals
 	activePrincipalCounts     map[string]uint64          // Counters for principals with active changes feeds
 	activePrincipalCountsLock sync.RWMutex               // Coordinates access to active principals map
-
 }
 
-func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIndexOptions, onChange func(base.Set), indexPartitionsCallback IndexPartitionsFunc) (err error) {
+func init() {
+	base.StatsExpvars.Set("indexReader.numReaders.OneShot", &indexReaderOneShotCount)
+	base.StatsExpvars.Set("indexReader.numReaders.Persistent", &indexReaderPersistentCount)
+	base.StatsExpvars.Set("indexReader.pollReaders.Time", &indexReaderPollReadersTime)
+	base.StatsExpvars.Set("indexReader.pollReaders.Count", &indexReaderPollReadersCount)
+	base.StatsExpvars.Set("indexReader.pollPrincipals.Time", &indexReaderPollPrincipalsTime)
+	base.StatsExpvars.Set("indexReader.pollPrincipals.Count", &indexReaderPollPrincipalsCount)
+	base.StatsExpvars.Set("indexReader.getChanges.Time", &indexReaderGetChangesTime)
+	base.StatsExpvars.Set("indexReader.getChanges.Count", &indexReaderGetChangesCount)
+	base.StatsExpvars.Set("indexReader.getChanges.UseCached", &indexReaderGetChangesUseCached)
+	base.StatsExpvars.Set("indexReader.getChanges.UseIndexed", &indexReaderGetChangesUseIndexed)
+}
+
+func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIndexOptions, onChange func(base.Set), indexPartitionsCallback IndexPartitionsFunc, context *DatabaseContext) (err error) {
 
 	k.channelIndexReaders = make(map[string]*KvChannelIndex)
 	k.indexPartitionsCallback = indexPartitionsCallback
@@ -61,9 +85,23 @@ func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIn
 		k.maxVbNo = 1024
 	}
 
+	// Make sure that the index bucket and data bucket have correct sequence parity
+	if err := k.verifyBucketSequenceParity(context); err != nil {
+		base.Warn("Unable to verify bucket sequence index parity [%v]. "+
+			"May indicate that Couchbase Server experienced a rollback,"+
+			" which Sync Gateway will attempt to handle gracefully.", err)
+	}
+
 	// Start background task to poll for changes
 	k.terminator = make(chan struct{})
 	k.pollingActive = make(chan struct{})
+
+	// Skip polling initialization if writer
+	if indexOptions != nil && indexOptions.Writer {
+		close(k.pollingActive)
+		return nil
+	}
+
 	go func(k *kvChangeIndexReader) {
 		defer close(k.pollingActive)
 		pollStart := time.Now()
@@ -82,7 +120,7 @@ func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIn
 				//       stable sequence polling each poll interval, even if we *actually* don't have any
 				//       active readers.
 				pollStart = time.Now()
-				if k.hasActiveReaders() && k.stableSequenceChanged() {
+				if k.stableSequenceChanged() {
 					var wg sync.WaitGroup
 					wg.Add(2)
 					go func() {
@@ -101,6 +139,21 @@ func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIn
 	}(k)
 
 	return nil
+}
+
+// Make sure that the index bucket and data bucket have correct sequence parity
+// https://github.com/couchbase/sync_gateway/issues/1133
+func (k *kvChangeIndexReader) verifyBucketSequenceParity(context *DatabaseContext) error {
+
+	// Verify that the index bucket stable sequence is equal to or later to the
+	// data bucket stable sequence
+	indexBucketStableClock, err := k.GetStableClock()
+	if err != nil {
+		return err
+	}
+
+	return base.VerifyBucketSequenceParity(indexBucketStableClock, context.Bucket)
+
 }
 
 func (k *kvChangeIndexReader) Clear() {
@@ -164,11 +217,20 @@ func (k *kvChangeIndexReader) stableSequenceChanged() bool {
 		return true
 	}
 
+	var prevTimingSeq uint64
+	if base.TimingExpvarsEnabled {
+		prevTimingSeq = k.readerStableSequence.GetSequence(base.KTimingExpvarVbNo)
+	}
+
 	isChanged, err := k.readerStableSequence.Load()
 
 	if err != nil {
 		base.Warn("Error loading reader stable sequence")
 		return false
+	}
+
+	if base.TimingExpvarsEnabled && isChanged {
+		base.TimingExpvars.UpdateBySequenceRange("StableSequence", base.KTimingExpvarVbNo, prevTimingSeq, k.readerStableSequence.GetSequence(base.KTimingExpvarVbNo))
 	}
 
 	return isChanged
@@ -230,52 +292,41 @@ func (k *kvChangeIndexReader) GetChanges(channelName string, options ChangesOpti
 		sinceClock = options.Since.Clock
 	}
 
-	reader, err := k.getOrCreateReader(channelName, options)
+	return k.GetChangesForRange(channelName, sinceClock, nil, options.Limit)
+}
+
+func (k *kvChangeIndexReader) GetChangesForRange(channelName string, sinceClock base.SequenceClock, toClock base.SequenceClock, limit int) ([]*LogEntry, error) {
+
+	defer indexReaderGetChangesTime.AddSince(time.Now())
+	defer indexReaderGetChangesCount.Add(1)
+
+	reader, err := k.getOrCreateReader(channelName)
 	if err != nil {
 		base.Warn("Error obtaining channel reader (need partition index?) for channel %s", channelName)
 		return nil, err
 	}
-	changes, err := reader.getChanges(sinceClock)
+	changes, err := reader.GetChanges(sinceClock, toClock, limit)
 	if err != nil {
 		base.LogTo("DIndex+", "No clock found for channel %s, assuming no entries in index", channelName)
 		return nil, nil
 	}
 
-	// Limit handling
-	if options.Limit > 0 && len(changes) > options.Limit {
-		limitResult := make([]*LogEntry, options.Limit)
-		copy(limitResult[0:], changes[0:])
-		return limitResult, nil
-	}
-
 	return changes, nil
 }
 
-func (k *kvChangeIndexReader) getOrCreateReader(channelName string, options ChangesOptions) (*KvChannelIndex, error) {
+func (k *kvChangeIndexReader) getOrCreateReader(channelName string) (*KvChannelIndex, error) {
 
-	// For continuous or longpoll processing, use the shared reader from the channelindexReaders map to coordinate
-	// polling.
-	if options.Wait {
-		var err error
-		index := k.getChannelReader(channelName)
-		if index == nil {
-			index, err = k.newChannelReader(channelName)
-			IndexExpvars.Add("getOrCreateReader_create", 1)
-			base.LogTo("DIndex+", "getOrCreateReader: Created new reader for channel %s", channelName)
-		} else {
-			IndexExpvars.Add("getOrCreateReader_get", 1)
-			base.LogTo("DIndex+", "getOrCreateReader: Using existing reader for channel %s", channelName)
-		}
-		return index, err
+	var err error
+	index := k.getChannelReader(channelName)
+	if index == nil {
+		index, err = k.newChannelReader(channelName)
+		IndexExpvars.Add("getOrCreateReader_create", 1)
+		base.LogTo("DIndex+", "getOrCreateReader: Created new reader for channel %s", channelName)
 	} else {
-		// For non-continuous/non-longpoll, use a one-off reader, no onChange handling.
-		indexPartitions, err := k.indexPartitionsCallback()
-		if err != nil {
-			return nil, err
-		}
-		return NewKvChannelIndex(channelName, k.indexReadBucket, indexPartitions, nil), nil
-
+		IndexExpvars.Add("getOrCreateReader_get", 1)
+		base.LogTo("DIndex+", "getOrCreateReader: Using existing reader for channel %s", channelName)
 	}
+	return index, err
 }
 
 func (k *kvChangeIndexReader) getChannelReader(channelName string) *KvChannelIndex {
@@ -298,7 +349,7 @@ func (k *kvChangeIndexReader) newChannelReader(channelName string) (*KvChannelIn
 		return nil, err
 	}
 	k.channelIndexReaders[channelName] = NewKvChannelIndex(channelName, k.indexReadBucket, indexPartitions, k.onChange)
-	IndexExpvars.Add("pollingChannels_active", 1)
+	indexReaderPersistentCount.Add(1)
 	return k.channelIndexReaders[channelName], nil
 }
 
@@ -317,6 +368,9 @@ func (k *kvChangeIndexReader) pollReaders() bool {
 	if len(k.channelIndexReaders) == 0 {
 		return true
 	}
+
+	defer indexReaderPollReadersTime.AddSince(time.Now())
+	defer indexReaderPollReadersCount.AddValue(int64(len(k.channelIndexReaders)))
 
 	// Build the set of clock keys to retrieve.  Stable sequence, plus one per channel reader
 	keySet := make([]string, len(k.channelIndexReaders))
@@ -388,7 +442,7 @@ func (k *kvChangeIndexReader) pollReaders() bool {
 
 	// Remove cancelled channels from channel readers
 	for channelName := range cancelledChannels {
-		IndexExpvars.Add("pollingChannels_active", -1)
+		indexReaderPersistentCount.Add(-1)
 		delete(k.channelIndexReaders, channelName)
 	}
 
@@ -407,6 +461,13 @@ func (k *kvChangeIndexReader) pollPrincipals() {
 	k.activePrincipalCountsLock.Lock()
 	defer k.activePrincipalCountsLock.Unlock()
 
+	if len(k.activePrincipalCounts) == 0 {
+		return
+	}
+
+	defer indexReaderPollPrincipalsTime.AddSince(time.Now())
+	defer indexReaderPollPrincipalsCount.AddValue(int64(len(k.activePrincipalCounts)))
+
 	// Check whether ANY principals have been updated since last poll, before doing the work of retrieving individual keys
 	overallCount, err := k.indexReadBucket.Incr(base.KTotalPrincipalCountKey, 0, 0, 0)
 	if err != nil {
@@ -418,24 +479,59 @@ func (k *kvChangeIndexReader) pollPrincipals() {
 	}
 	k.overallPrincipalCount = overallCount
 
-	// There's been a change - check whether any of our active principals have changed
+	// There's been a change - check if our active principals have changed
 	var changedWaitKeys []string
-	for principalID, currentCount := range k.activePrincipalCounts {
-		key := fmt.Sprintf(base.KPrincipalCountKeyFormat, principalID)
-		newCount, err := k.indexReadBucket.Incr(key, 0, 0, 0)
-		if err != nil {
-			base.Warn("Principal polling encountered error getting overall count for key %s:%v", key, err)
-			continue
+
+	// When using a gocb bucket, use a single bulk operation to retrieve counters.
+	if gocbIndexBucket, ok := k.indexReadBucket.(base.CouchbaseBucketGoCB); ok {
+		principalKeySet := make([]string, len(k.activePrincipalCounts))
+		i := 0
+		for principalID, _ := range k.activePrincipalCounts {
+			key := fmt.Sprintf(base.KPrincipalCountKeyFormat, principalID)
+			principalKeySet[i] = key
+			i++
 		}
-		if newCount != currentCount {
-			k.activePrincipalCounts[principalID] = newCount
-			waitKey := strings.TrimPrefix(key, base.KPrincipalCountKeyPrefix)
-			changedWaitKeys = append(changedWaitKeys, waitKey)
+
+		bulkGetResults, err := gocbIndexBucket.GetBulkCounters(principalKeySet)
+		if err != nil {
+			base.Warn("Error during GetBulkRaw while polling principals: %v", err)
+		}
+
+		for principalID, currentCount := range k.activePrincipalCounts {
+			key := fmt.Sprintf(base.KPrincipalCountKeyFormat, principalID)
+			newCount, ok := bulkGetResults[key]
+			if !ok {
+				base.Warn("Expected key not found in results when checking for principal updates, key:[%s]", key)
+				continue
+			}
+			if newCount != currentCount {
+				k.activePrincipalCounts[principalID] = newCount
+				waitKey := strings.TrimPrefix(key, base.KPrincipalCountKeyPrefix)
+				changedWaitKeys = append(changedWaitKeys, waitKey)
+			}
+		}
+	} else {
+		// TODO: Add bulk counter retrieval support to walrus, go-couchbase.  Until then, doing sequential gets
+		// There's been a change - check whether any of our active principals have changed
+		for principalID, currentCount := range k.activePrincipalCounts {
+			key := fmt.Sprintf(base.KPrincipalCountKeyFormat, principalID)
+			newCount, err := k.indexReadBucket.Incr(key, 0, 0, 0)
+			if err != nil {
+				base.Warn("Principal polling encountered error getting overall count for key %s:%v", key, err)
+				continue
+			}
+			if newCount != currentCount {
+				k.activePrincipalCounts[principalID] = newCount
+				waitKey := strings.TrimPrefix(key, base.KPrincipalCountKeyPrefix)
+				changedWaitKeys = append(changedWaitKeys, waitKey)
+			}
 		}
 	}
+
 	if len(changedWaitKeys) > 0 {
 		k.onChange(base.SetFromArray(changedWaitKeys))
 	}
+
 }
 
 // AddActivePrincipal - adds one or more principal keys to the set being polled.
