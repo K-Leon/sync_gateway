@@ -14,20 +14,19 @@ import (
 	"strings"
 
 	sgbucket "github.com/couchbase/sg-bucket"
+	"github.com/couchbase/sync_gateway/base"
 	"github.com/robertkrimen/otto"
 	_ "github.com/robertkrimen/otto/underscore"
-
-	"github.com/couchbase/sync_gateway/base"
 )
 
+// Prefix used to identify roles in access grants
+const RoleAccessPrefix = "role:"
+
 const funcWrapper = `
-	function(newDoc, oldDoc, realUserCtx) {
+	function() {
 
-		var v = %s;
-
-		if (oldDoc) {
-			oldDoc._id = newDoc._id;
-		}
+		var realUserCtx, shouldValidate;
+		var syncFn = %s;
 
 		function makeArray(maybeArray) {
 			if (Array.isArray(maybeArray)) {
@@ -57,9 +56,6 @@ const funcWrapper = `
 			return false;
 		}
 
-		// Proxy userCtx that allows queries but not direct access to user/roles:
-		var shouldValidate = (realUserCtx != null && realUserCtx.name != null);
-
 		function requireUser(names) {
 				if (!shouldValidate) return;
 				names = makeArray(names);
@@ -81,17 +77,28 @@ const funcWrapper = `
 					throw({forbidden: "missing channel access"});
 		}
 
-		try {
-			v(newDoc, oldDoc);
-		} catch(x) {
-			if (x.forbidden)
+		return function (newDoc, oldDoc, _realUserCtx) {
+			realUserCtx = _realUserCtx;
+
+			if (oldDoc) {
+				oldDoc._id = newDoc._id;
+			}
+
+			// Proxy userCtx that allows queries but not direct access to user/roles:
+			shouldValidate = (realUserCtx != null && realUserCtx.name != null);
+
+			try {
+				syncFn(newDoc, oldDoc);
+			} catch(x) {
+				if (x.forbidden)
 				reject(403, x.forbidden);
-			else if (x.unauthorized)
+				else if (x.unauthorized)
 				reject(401, x.unauthorized);
-			else
+				else
 				throw(x);
+			}
 		}
-	}`
+	}()`
 
 // An object that runs a specific JS sync() function. Not thread-safe!
 type SyncRunner struct {
@@ -100,6 +107,7 @@ type SyncRunner struct {
 	channels          []string
 	access            map[string][]string // channels granted to users via access() callback
 	roles             map[string][]string // roles granted to users via role() callback
+	expiry            *uint32             // document expiry (in seconds) specified via expiry() callback
 }
 
 func NewSyncRunner(funcSource string) (*SyncRunner, error) {
@@ -144,11 +152,37 @@ func NewSyncRunner(funcSource string) (*SyncRunner, error) {
 		return otto.UndefinedValue()
 	})
 
+	// Implementation of the 'expiry()' callback:
+	runner.DefineNativeFunction("expiry", func(call otto.FunctionCall) otto.Value {
+		if len(call.ArgumentList) > 0 {
+			rawExpiry, exportErr := call.Argument(0).Export()
+			if exportErr != nil {
+				base.Warn("SyncRunner: Unable to export expiry parameter: %v Error: %s", call.Argument(0), exportErr)
+				return otto.UndefinedValue()
+			}
+
+			// Called expiry with null/undefined value - ignore
+			if rawExpiry == nil || call.Argument(0).IsUndefined() {
+				return otto.UndefinedValue()
+			}
+
+			expiry, reflectErr := base.ReflectExpiry(rawExpiry)
+			if reflectErr != nil {
+				base.Warn("SyncRunner: Invalid value passed to expiry().  Value:%+v ", call.Argument(0))
+				return otto.UndefinedValue()
+			}
+
+			runner.expiry = expiry
+		}
+		return otto.UndefinedValue()
+	})
+
 	runner.Before = func() {
 		runner.output = &ChannelMapperOutput{}
 		runner.channels = []string{}
 		runner.access = map[string][]string{}
 		runner.roles = map[string][]string{}
+		runner.expiry = nil
 	}
 	runner.After = func(result otto.Value, err error) (interface{}, error) {
 		output := runner.output
@@ -158,8 +192,11 @@ func NewSyncRunner(funcSource string) (*SyncRunner, error) {
 			if err == nil {
 				output.Access, err = compileAccessMap(runner.access, "")
 				if err == nil {
-					output.Roles, err = compileAccessMap(runner.roles, "role:")
+					output.Roles, err = compileAccessMap(runner.roles, RoleAccessPrefix)
 				}
+			}
+			if runner.expiry != nil {
+				output.Expiry = runner.expiry
 			}
 		}
 		return output, err
@@ -202,6 +239,14 @@ func compileAccessMap(input map[string][]string, prefix string) (AccessMap, erro
 		}
 	}
 	return access, nil
+}
+
+// If the provided principal name (in access grant format) is a role, returns the role name without prefix
+func AccessNameToPrincipalName(accessPrincipalName string) (principalName string, isRole bool) {
+	if strings.HasPrefix(accessPrincipalName, RoleAccessPrefix) {
+		return accessPrincipalName[len(RoleAccessPrefix):], true
+	}
+	return accessPrincipalName, false
 }
 
 // Converts a JS string or array into a Go string array.

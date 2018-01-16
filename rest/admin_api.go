@@ -173,7 +173,7 @@ type ReplicationConfig struct {
 	QueryParams      interface{} `json:"query_params"`
 	Cancel           bool        `json:"cancel"`
 	Async            bool        `json:"async"`
-	ChangesFeedLimit int         `json:"changes_feed_limit"`
+	ChangesFeedLimit *int        `json:"changes_feed_limit"`
 	ReplicationId    string      `json:"replication_id"`
 }
 
@@ -218,7 +218,6 @@ func validateReplicationParameters(requestParams ReplicationConfig, paramsFromCo
 		}
 	}
 
-
 	sourceUrl, err := url.Parse(requestParams.Source)
 	if err != nil || requestParams.Source == "" {
 		err = base.HTTPErrorf(http.StatusBadRequest, "/_replicate source URL [%s] is invalid.", requestParams.Source)
@@ -247,7 +246,11 @@ func validateReplicationParameters(requestParams ReplicationConfig, paramsFromCo
 	}
 
 	params.Async = requestParams.Async
-	params.ChangesFeedLimit = requestParams.ChangesFeedLimit
+	if requestParams.ChangesFeedLimit != nil {
+		params.ChangesFeedLimit = *requestParams.ChangesFeedLimit
+	} else {
+		params.ChangesFeedLimit = sgreplicate.DefaultChangesFeedLimit
+	}
 
 	if requestParams.Filter != "" {
 		if requestParams.Filter == "sync_gateway/bychannel" {
@@ -289,7 +292,6 @@ func validateReplicationParameters(requestParams ReplicationConfig, paramsFromCo
 		}
 	}
 
-
 	//If source and/or target are local DB names add local AdminInterface URL
 	localDbUrl := "http://" + adminInterface
 	if params.Source == nil {
@@ -315,9 +317,20 @@ func (h *handler) handleActiveTasks() error {
 func (h *handler) handleGetRawDoc() error {
 	h.assertAdminOnly()
 	docid := h.PathVar("docid")
-	doc, err := h.db.GetDoc(docid)
+	doc, err := h.db.GetDocument(docid, db.DocUnmarshalAll)
 	if doc != nil {
 		h.writeJSON(doc)
+	}
+	return err
+}
+
+func (h *handler) handleGetRevTree() error {
+	h.assertAdminOnly()
+	docid := h.PathVar("docid")
+	doc, err := h.db.GetDocument(docid, db.DocUnmarshalAll)
+
+	if doc != nil {
+		h.writeText([]byte(doc.History.RenderGraphvizDot()))
 	}
 	return err
 }
@@ -333,7 +346,7 @@ func (h *handler) handleSetLogging() error {
 		return nil
 	}
 	if h.getQuery("level") != "" {
-		base.SetLogLevel(int(getRestrictedIntQuery(h.rq.URL.Query(), "level", uint64(base.LogLevel()), 1, 3, false)))
+		base.SetLogLevel(int(getRestrictedIntQuery(h.getQueryValues(), "level", uint64(base.LogLevel()), 1, 3, false)))
 		if len(body) == 0 {
 			return nil // empty body is OK if request is just setting the log level
 		}
@@ -588,7 +601,7 @@ func (h *handler) handlePurge() error {
 			}
 
 			//Attempt to delete document, if successful add to response, otherwise log warning
-			err = h.db.Bucket.Delete(key)
+			err = h.db.Purge(key)
 			if err == nil {
 
 				if first {

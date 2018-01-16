@@ -1,7 +1,6 @@
 package db
 
 import (
-	"encoding/json"
 	"net/http"
 	"reflect"
 	"regexp"
@@ -29,7 +28,8 @@ type Shadower struct {
 
 // Creates a new Shadower.
 func NewShadower(context *DatabaseContext, bucket base.Bucket, docIDPattern *regexp.Regexp) (*Shadower, error) {
-	tapFeed, err := bucket.StartTapFeed(sgbucket.TapArguments{Backfill: 0, Notify: func(bucket string, err error) {
+
+	tapFeed, err := bucket.StartTapFeed(sgbucket.FeedArguments{Backfill: 0, Notify: func(bucket string, err error) {
 		context.TakeDbOffline("Lost shadower TAP Feed")
 	}})
 	if err != nil {
@@ -62,18 +62,18 @@ func (s *Shadower) readTapFeed() {
 	vbucketsFilling := 0
 	for event := range s.tapFeed.Events() {
 		switch event.Opcode {
-		case sgbucket.TapBeginBackfill:
+		case sgbucket.FeedOpBeginBackfill:
 			if vbucketsFilling == 0 {
 				base.LogTo("Shadow", "Reading history of external bucket")
 			}
 			vbucketsFilling++
 			//base.LogTo("Shadow", "Reading history of external bucket")
-		case sgbucket.TapMutation, sgbucket.TapDeletion:
+		case sgbucket.FeedOpMutation, sgbucket.FeedOpDeletion:
 			key := string(event.Key)
 			if !s.docIDMatches(key) {
 				break
 			}
-			isDeletion := event.Opcode == sgbucket.TapDeletion
+			isDeletion := event.Opcode == sgbucket.FeedOpDeletion
 			if !isDeletion && event.Expiry > 0 {
 				break // ignore ephemeral documents
 			}
@@ -82,7 +82,7 @@ func (s *Shadower) readTapFeed() {
 				base.Warn("Error applying change %q from external bucket: %v", key, err)
 			}
 			atomic.AddUint64(&s.pullCount, 1)
-		case sgbucket.TapEndBackfill:
+		case sgbucket.FeedOpEndBackfill:
 			if vbucketsFilling--; vbucketsFilling == 0 {
 				base.LogTo("Shadow", "Caught up with history of external bucket")
 			}
@@ -97,28 +97,29 @@ func (s *Shadower) pullDocument(key string, value []byte, isDeletion bool, cas u
 	if isDeletion {
 		body = Body{"_deleted": true}
 	} else {
-		if err := json.Unmarshal(value, &body); err != nil {
+		if err := body.Unmarshal(value); err != nil {
 			base.LogTo("Shadow", "Doc %q is not JSON; skipping", key)
 			return nil
 		}
 	}
 
 	db, _ := CreateDatabase(s.context)
-	expiry, err := body.getExpiry()
+	expiry, _, err := body.getExpiry()
 	if err != nil {
 		return base.HTTPErrorf(http.StatusBadRequest, "Invalid expiry: %v", err)
 	}
-	_, err = db.updateDoc(key, false, expiry, func(doc *document) (Body, AttachmentData, error) {
+
+	_, err = db.updateDoc(key, false, expiry, func(doc *document) (resultBody Body, resultAttachmentData AttachmentData, updatedExpiry *uint32, resultErr error) {
 		// (Be careful: this block can be invoked multiple times if there are races!)
 		if doc.UpstreamCAS != nil && *doc.UpstreamCAS == cas {
-			return nil, nil, couchbase.UpdateCancel // we already have this doc revision
+			return nil, nil, nil, couchbase.UpdateCancel // we already have this doc revision
 		}
 		base.LogTo("Shadow+", "Pulling %q, CAS=%x ... have UpstreamRev=%q, UpstreamCAS=%x", key, cas, doc.UpstreamRev, doc.UpstreamCAS)
 
 		// Compare this body to the current revision body to see if it's an echo:
 		parentRev := doc.UpstreamRev
 		newRev := doc.CurrentRev
-		if !reflect.DeepEqual(body, doc.getRevision(newRev)) {
+		if !reflect.DeepEqual(body, doc.getRevisionBody(newRev, s.context.RevisionBodyLoader)) {
 			// Nope, it's not. Assign it a new rev ID
 			generation, _ := ParseRevID(parentRev)
 			newRev = createRevID(generation+1, parentRev, body)
@@ -135,14 +136,16 @@ func (s *Shadower) pullDocument(key string, value []byte, isDeletion bool, cas u
 				base.Warn("Shadow: Adding revision as conflict branch, parent id %q is missing", parentRev)
 				parentRev = ""
 			}
-			doc.History.addRevision(RevInfo{ID: newRev, Parent: parentRev, Deleted: isDeletion})
+			if err = doc.History.addRevision(doc.ID, RevInfo{ID: newRev, Parent: parentRev, Deleted: isDeletion}); err != nil {
+				return nil, nil, nil, err
+			}
 			base.LogTo("Shadow", "Pulling %q, CAS=%x --> rev %q", key, cas, newRev)
 		} else {
 			// We already have this rev; but don't cancel, because we do need to update the
 			// doc's UpstreamRev/UpstreamCAS fields.
 			base.LogTo("Shadow+", "Not pulling %q, CAS=%x (echo of rev %q)", key, cas, newRev)
 		}
-		return body, nil, nil
+		return body, nil, nil, nil
 	})
 	if err == couchbase.UpdateCancel {
 		err = nil
@@ -165,7 +168,7 @@ func (s *Shadower) PushRevision(doc *document) {
 		err = s.bucket.Delete(doc.ID)
 	} else {
 		base.LogTo("Shadow", "Pushing %q, rev %q", doc.ID, doc.CurrentRev)
-		body := doc.getRevision(doc.CurrentRev)
+		body := doc.getRevisionBody(doc.CurrentRev, s.context.RevisionBodyLoader)
 		if body == nil {
 			base.Warn("Can't get rev %q.%q to push to external bucket", doc.ID, doc.CurrentRev)
 			return

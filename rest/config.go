@@ -23,10 +23,10 @@ import (
 	"github.com/couchbase/sync_gateway/auth"
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/db"
-)
 
-// Register profiling handlers (see Go docs)
-import _ "net/http/pprof"
+	// Register profiling handlers (see Go docs)
+	_ "net/http/pprof"
+)
 
 var DefaultInterface = ":4984"
 var DefaultAdminInterface = "127.0.0.1:4985" // Only accessible on localhost!
@@ -112,22 +112,27 @@ func (c ClusterConfig) CBGTEnabled() bool {
 // JSON object that defines a database configuration within the ServerConfig.
 type DbConfig struct {
 	BucketConfig
-	Name               string                         `json:"name,omitempty"`                 // Database name in REST API (stored as key in JSON)
-	Sync               *string                        `json:"sync,omitempty"`                 // Sync function defines which users can see which data
-	Users              map[string]*db.PrincipalConfig `json:"users,omitempty"`                // Initial user accounts
-	Roles              map[string]*db.PrincipalConfig `json:"roles,omitempty"`                // Initial roles
-	RevsLimit          *uint32                        `json:"revs_limit,omitempty"`           // Max depth a document's revision tree can grow to
-	ImportDocs         interface{}                    `json:"import_docs,omitempty"`          // false, true, or "continuous"
-	Shadow             *ShadowConfig                  `json:"shadow,omitempty"`               // External bucket to shadow
-	EventHandlers      interface{}                    `json:"event_handlers,omitempty"`       // Event handlers (webhook)
-	FeedType           string                         `json:"feed_type,omitempty"`            // Feed type - "DCP" or "TAP"; defaults based on Couchbase server version
-	AllowEmptyPassword bool                           `json:"allow_empty_password,omitempty"` // Allow empty passwords?  Defaults to false
-	CacheConfig        *CacheConfig                   `json:"cache,omitempty"`                // Cache settings
-	ChannelIndex       *ChannelIndexConfig            `json:"channel_index,omitempty"`        // Channel index settings
-	RevCacheSize       *uint32                        `json:"rev_cache_size,omitempty"`       // Maximum number of revisions to store in the revision cache
-	StartOffline       bool                           `json:"offline,omitempty"`              // start the DB in the offline state, defaults to false
-	Unsupported        *UnsupportedConfig             `json:"unsupported,omitempty"`          // Config for unsupported features
-	OIDCConfig         *auth.OIDCOptions              `json:"oidc,omitempty"`                 // Config properties for OpenID Connect authentication
+	Name                 string                         `json:"name,omitempty"`                        // Database name in REST API (stored as key in JSON)
+	Sync                 *string                        `json:"sync,omitempty"`                        // Sync function defines which users can see which data
+	Users                map[string]*db.PrincipalConfig `json:"users,omitempty"`                       // Initial user accounts
+	Roles                map[string]*db.PrincipalConfig `json:"roles,omitempty"`                       // Initial roles
+	RevsLimit            *uint32                        `json:"revs_limit,omitempty"`                  // Max depth a document's revision tree can grow to
+	ImportDocs           interface{}                    `json:"import_docs,omitempty"`                 // false, true, or "continuous"
+	ImportFilter         *string                        `json:"import_filter,omitempty"`               // Filter function (import)
+	Shadow               *ShadowConfig                  `json:"shadow,omitempty"`                      // External bucket to shadow
+	EventHandlers        interface{}                    `json:"event_handlers,omitempty"`              // Event handlers (webhook)
+	FeedType             string                         `json:"feed_type,omitempty"`                   // Feed type - "DCP" or "TAP"; defaults based on Couchbase server version
+	AllowEmptyPassword   bool                           `json:"allow_empty_password,omitempty"`        // Allow empty passwords?  Defaults to false
+	CacheConfig          *CacheConfig                   `json:"cache,omitempty"`                       // Cache settings
+	ChannelIndex         *ChannelIndexConfig            `json:"channel_index,omitempty"`               // Channel index settings
+	RevCacheSize         *uint32                        `json:"rev_cache_size,omitempty"`              // Maximum number of revisions to store in the revision cache
+	StartOffline         bool                           `json:"offline,omitempty"`                     // start the DB in the offline state, defaults to false
+	Unsupported          db.UnsupportedOptions          `json:"unsupported,omitempty"`                 // Config for unsupported features
+	OIDCConfig           *auth.OIDCOptions              `json:"oidc,omitempty"`                        // Config properties for OpenID Connect authentication
+	OldRevExpirySeconds  *uint32                        `json:"old_rev_expiry_seconds,omitempty"`      // The number of seconds before old revs are removed from CBS bucket
+	ViewQueryTimeoutSecs *uint32                        `json:"view_query_timeout_secs,omitempty"`     // The view query timeout in seconds
+	LocalDocExpirySecs   *uint32                        `json:"local_doc_expiry_secs,omitempty"`       // The _local doc expiry time in seconds
+	EnableXattrs         *bool                          `json:"enable_shared_bucket_access,omitempty"` // Whether to use extended attributes to store _sync metadata
 }
 
 type DbConfigMap map[string]*DbConfig
@@ -182,9 +187,10 @@ type CacheConfig struct {
 
 type ChannelIndexConfig struct {
 	BucketConfig
-	IndexWriter        bool                `json:"writer,omitempty"`      // Whether SG node is a channel index writer
-	NumShards          uint16              `json:"num_shards,omitempty"`  // Number of partitions in the channel index
-	SequenceHashConfig *SequenceHashConfig `json:"seq_hashing,omitempty"` // Sequence hash configuration
+	IndexWriter               bool                `json:"writer,omitempty"`       // Whether SG node is a channel index writer
+	NumShards                 uint16              `json:"num_shards,omitempty"`   // Number of partitions in the channel index
+	SequenceHashConfig        *SequenceHashConfig `json:"seq_hashing,omitempty"`  // Sequence hash configuration
+	TombstoneCompactFrequency *int                `json:"tombstone_compact_freq"` // How often sg-accel attempts to compact purged tombstones
 }
 
 type SequenceHashConfig struct {
@@ -193,17 +199,8 @@ type SequenceHashConfig struct {
 	Frequency    *int    `json:"hash_frequency,omitempty"` // Frequency of sequence hashing in changes feeds
 }
 
-type UnsupportedConfig struct {
-	UserViews        *UserViewsConfig            `json:"user_views,omitempty"`         // Config settings for user views
-	OidcTestProvider *db.OidcTestProviderOptions `json:"oidc_test_provider,omitempty"` // Config settings for OIDC Provider
-}
-
 type UnsupportedServerConfig struct {
 	Http2Config *Http2Config `json:"http2,omitempty"` // Config settings for HTTP2
-}
-
-type UserViewsConfig struct {
-	Enabled *bool `json:"enabled,omitempty"` // Whether pass-through view query is supported through public API
 }
 
 type Http2Config struct {
@@ -315,6 +312,10 @@ func (dbConfig *DbConfig) validateSgDbConfig() error {
 		return err
 	}
 
+	if dbConfig.FeedType == base.TapFeedType && dbConfig.ImportDocs == "continuous" {
+		return fmt.Errorf("Invalid configuration for Sync Gw. TAP feed type can not be used with auto-import")
+	}
+
 	return nil
 
 }
@@ -370,6 +371,13 @@ func (dbConfig *DbConfig) GetCredentials() (string, string, string) {
 	return base.TransformBucketCredentials(dbConfig.Username, dbConfig.Password, *dbConfig.Bucket)
 }
 
+func (dbConfig *DbConfig) UseXattrs() bool {
+	if dbConfig.EnableXattrs != nil {
+		return *dbConfig.EnableXattrs
+	}
+	return base.DefaultUseXattrs
+}
+
 // Implementation of AuthHandler interface for ShadowConfig
 func (shadowConfig *ShadowConfig) GetCredentials() (string, string, string) {
 	return base.TransformBucketCredentials(shadowConfig.Username, shadowConfig.Password, *shadowConfig.Bucket)
@@ -378,6 +386,11 @@ func (shadowConfig *ShadowConfig) GetCredentials() (string, string, string) {
 // Implementation of AuthHandler interface for ChannelIndexConfig
 func (channelIndexConfig *ChannelIndexConfig) GetCredentials() (string, string, string) {
 	return base.TransformBucketCredentials(channelIndexConfig.Username, channelIndexConfig.Password, *channelIndexConfig.Bucket)
+}
+
+// Implementation of AuthHandler interface for ClusterConfig
+func (clusterConfig *ClusterConfig) GetCredentials() (string, string, string) {
+	return base.TransformBucketCredentials(clusterConfig.Username, clusterConfig.Password, *clusterConfig.Bucket)
 }
 
 // Reads a ServerConfig from raw data
@@ -740,7 +753,7 @@ func (config *ServerConfig) NumIndexWriters() int {
 func RunServer(config *ServerConfig) {
 	PrettyPrint = config.Pretty
 
-	base.Logf("==== %s ====", LongVersionString)
+	base.Logf("==== %s ====", base.LongVersionString)
 
 	if os.Getenv("GOMAXPROCS") == "" && runtime.GOMAXPROCS(0) == 1 {
 		cpus := runtime.NumCPU()

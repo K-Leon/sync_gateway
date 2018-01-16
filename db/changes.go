@@ -47,6 +47,7 @@ type ChangeEntry struct {
 	allRemoved bool        // Flag to track whether an entry is a removal in all channels visible to the user.
 	branched   bool
 	backfill   backfillFlag // Flag used to identify non-client entries used for backfill synchronization (di only)
+	pseudoDoc  bool         // Used to indicate _user docs e.t.c
 }
 
 const (
@@ -75,21 +76,66 @@ func (db *Database) AddDocToChangeEntry(entry *ChangeEntry, options ChangesOptio
 
 // Adds a document body and/or its conflicts to a ChangeEntry
 func (db *Database) addDocToChangeEntry(entry *ChangeEntry, options ChangesOptions) {
+
 	includeConflicts := options.Conflicts && entry.branched
 	if !options.IncludeDocs && !includeConflicts {
 		return
 	}
-	doc, err := db.GetDoc(entry.ID)
-	if err != nil {
-		base.Warn("Changes feed: error getting doc %q: %v", entry.ID, err)
+
+	// If this is pseudo doc, it will not be in the cache so ignore
+	if entry.pseudoDoc {
 		return
 	}
 
-	db.AddDocInstanceToChangeEntry(entry, doc, options)
+	// Three options for retrieving document content, depending on what's required:
+	//   includeConflicts only:
+	//      - Retrieve document metadata from bucket (required to identify current set of conflicts)
+	//   includeDocs only:
+	//      - Use rev cache to retrieve document body
+	//   includeConflicts and includeDocs:
+	//      - Retrieve document AND metadata from bucket; single round-trip usually more efficient than
+	//      metadata retrieval + rev cache retrieval (since rev cache miss will trigger KV retrieval of doc+metadata again)
+
+	if options.IncludeDocs && includeConflicts {
+		// Load doc body + metadata
+		doc, err := db.GetDocument(entry.ID, DocUnmarshalAll)
+		if err != nil {
+			base.Warn("Changes feed: error getting doc %q: %v", entry.ID, err)
+			return
+		}
+		db.AddDocInstanceToChangeEntry(entry, doc, options)
+
+	} else if includeConflicts {
+		// Load doc metadata only
+		doc := &document{}
+		var err error
+		doc.syncData, err = db.GetDocSyncData(entry.ID)
+		if err != nil {
+			base.Warn("Changes feed: error getting doc sync data %q: %v", entry.ID, err)
+			return
+		}
+		db.AddDocInstanceToChangeEntry(entry, doc, options)
+
+	} else if options.IncludeDocs {
+		// Retrieve document from rev cache
+		revID := entry.Changes[0]["rev"]
+		err := db.AddDocToChangeEntryUsingRevCache(entry, revID)
+		if err != nil {
+			base.Warn("Changes feed: error getting revision body for %q (%s): %v", entry.ID, revID, err)
+		}
+	}
+
+}
+
+func (db *Database) AddDocToChangeEntryUsingRevCache(entry *ChangeEntry, revID string) (err error) {
+	// GetRevWithHistory for (doc, rev, no max history, no history from, no attachments, no _exp)
+	entry.Doc, err = db.GetRevWithHistory(entry.ID, revID, 0, nil, nil, false)
+	return err
 }
 
 // Adds a document body and/or its conflicts to a ChangeEntry
 func (db *Database) AddDocInstanceToChangeEntry(entry *ChangeEntry, doc *document, options ChangesOptions) {
+
 	includeConflicts := options.Conflicts && entry.branched
 
 	revID := entry.Changes[0]["rev"]
@@ -106,6 +152,10 @@ func (db *Database) AddDocInstanceToChangeEntry(entry *ChangeEntry, doc *documen
 		})
 	}
 	if options.IncludeDocs {
+		if doc.Body() == nil {
+			base.Warn("AddDocInstanceToChangeEntry called with options.IncludeDocs, but doc is missing Body")
+			return
+		}
 		var err error
 		entry.Doc, err = db.getRevFromDoc(doc, revID, false)
 		if err != nil {
@@ -250,9 +300,10 @@ func (db *Database) appendUserFeed(feeds []<-chan *ChangeEntry, names []string, 
 			name = base.GuestUsername
 		}
 		entry := ChangeEntry{
-			Seq:     userSeq,
-			ID:      "_user/" + name,
-			Changes: []ChangeRev{},
+			Seq:       userSeq,
+			ID:        "_user/" + name,
+			Changes:   []ChangeRev{},
+			pseudoDoc: true,
 		}
 		userFeed := make(chan *ChangeEntry, 1)
 		userFeed <- &entry
@@ -298,7 +349,7 @@ func (db *Database) SimpleMultiChangesFeed(chans base.Set, options ChangesOption
 		to = fmt.Sprintf("  (to %s)", db.user.Name())
 	}
 
-	base.LogTo("Changes", "MultiChangesFeed(%s, %+v) ... %s", chans, options, to)
+	base.LogTo("Changes", "MultiChangesFeed(channels: %s, options: %+v) ... %s", chans, options, to)
 	output := make(chan *ChangeEntry, 50)
 
 	go func() {
@@ -315,15 +366,6 @@ func (db *Database) SimpleMultiChangesFeed(chans base.Set, options ChangesOption
 		var addedChannels base.Set // Tracks channels added to the user during changes processing.
 		var userChanged bool       // Whether the user document has changed in a given iteration loop
 		var deferredBackfill bool  // Whether there's a backfill identified in the user doc that's deferred while the SG cache catches up
-
-		// lowSequence is used to send composite keys to clients, so that they can obtain any currently
-		// skipped sequences in a future iteration or request.
-		oldestSkipped := db.changeCache.getOldestSkippedSequence()
-		if oldestSkipped > 0 {
-			lowSequence = oldestSkipped - 1
-		} else {
-			lowSequence = 0
-		}
 
 		// Retrieve the current max cached sequence - ensures there isn't a race between the subsequent channel cache queries
 		currentCachedSequence = db.changeCache.GetStableSequence("").Seq
@@ -354,14 +396,6 @@ func (db *Database) SimpleMultiChangesFeed(chans base.Set, options ChangesOption
 			channelsSince = channels.AtSequence(chans, 0)
 		}
 
-		// If a request has a low sequence that matches the current lowSequence,
-		// ignore the low sequence.  This avoids infinite looping of the records between
-		// low::high.  It also means any additional skipped sequences between low::high won't
-		// be sent until low arrives or is abandoned.
-		if options.Since.LowSeq != 0 && options.Since.LowSeq == lowSequence {
-			options.Since.LowSeq = 0
-		}
-
 		// For a continuous feed, initialise the lateSequenceFeeds that track late-arriving sequences
 		// to the channel caches.
 		if options.Continuous {
@@ -380,11 +414,19 @@ func (db *Database) SimpleMultiChangesFeed(chans base.Set, options ChangesOption
 
 			// lowSequence is used to send composite keys to clients, so that they can obtain any currently
 			// skipped sequences in a future iteration or request.
-			oldestSkipped = db.changeCache.getOldestSkippedSequence()
+			oldestSkipped := db.changeCache.getOldestSkippedSequence()
 			if oldestSkipped > 0 {
 				lowSequence = oldestSkipped - 1
 			} else {
 				lowSequence = 0
+			}
+
+			// If a request has a low sequence that matches the current lowSequence,
+			// ignore the low sequence.  This avoids infinite looping of the records between
+			// low::high.  It also means any additional skipped sequences between low::high won't
+			// be sent until low arrives or is abandoned.
+			if options.Since.LowSeq != 0 && options.Since.LowSeq == lowSequence {
+				options.Since.LowSeq = 0
 			}
 
 			// Populate the parallel arrays of channels and names:
@@ -560,6 +602,7 @@ func (db *Database) SimpleMultiChangesFeed(chans base.Set, options ChangesOption
 				}
 
 				// Update the low sequence on the entry we're going to send
+				// NOTE: if 0, the low seq part of compound sequence gets removed
 				minEntry.Seq.LowSeq = lowSequence
 
 				// Send the entry, and repeat the loop:
@@ -589,6 +632,7 @@ func (db *Database) SimpleMultiChangesFeed(chans base.Set, options ChangesOption
 			// First notify the reader that we're waiting by sending a nil.
 			base.LogTo("Changes+", "MultiChangesFeed waiting... %s", to)
 			output <- nil
+
 		waitForChanges:
 			for {
 				// If we're in a deferred Backfill, the user may not get notification when the cache catches up to the backfill (e.g. when the granting doc isn't

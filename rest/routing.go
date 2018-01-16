@@ -108,6 +108,8 @@ func createHandler(sc *ServerContext, privs handlerPrivs) (*mux.Router, *mux.Rou
 	oidcr.Handle("/authenticate", makeHandler(sc, publicPrivs,
 		(*handler).handleOidcTestProviderAuthenticate)).Methods("GET", "POST")
 
+	dbr.Handle("/_blipsync", makeHandler(sc, privs, (*handler).handleBLIPSync)).Methods("GET")
+
 	return r, dbr
 }
 
@@ -162,6 +164,9 @@ func CreateAdminRouter(sc *ServerContext) *mux.Router {
 
 	dbr.Handle("/_raw/{docid:"+docRegex+"}",
 		makeHandler(sc, adminPrivs, (*handler).handleGetRawDoc)).Methods("GET", "HEAD")
+
+	dbr.Handle("/_revtree/{docid:"+docRegex+"}",
+		makeHandler(sc, adminPrivs, (*handler).handleGetRevTree)).Methods("GET")
 
 	dbr.Handle("/_user/",
 		makeHandler(sc, adminPrivs, (*handler).getUsers)).Methods("GET", "HEAD")
@@ -258,6 +263,8 @@ func CreateAdminRouter(sc *ServerContext) *mux.Router {
 		makeHandler(sc, adminPrivs, (*handler).handleIndexChannel)).Methods("GET")
 	dbr.Handle("/_index/channels",
 		makeHandler(sc, adminPrivs, (*handler).handleIndexAllChannels)).Methods("GET")
+	dbr.Handle("/_repair",
+		makeHandler(sc, adminPrivs, (*handler).handleRepair)).Methods("POST")
 
 	// The routes below are part of the CouchDB REST API but should only be available to admins,
 	// so the handlers are moved to the admin port.

@@ -12,20 +12,19 @@ package db
 import (
 	"fmt"
 	"log"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/couchbaselabs/go.assert"
-
+	"github.com/couchbase/sg-bucket"
 	"github.com/couchbase/sync_gateway/auth"
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/channels"
+	"github.com/couchbaselabs/go.assert"
 	"github.com/robertkrimen/otto/underscore"
+
+	"strings"
 )
-
-//const kTestURL = "http://localhost:8091"
-
-const kTestURL = "walrus:"
 
 func init() {
 	base.LogNoColor()
@@ -34,61 +33,99 @@ func init() {
 	underscore.Disable() // It really slows down unit tests (by making otto.New take a lot longer)
 }
 
-func testBucket() base.Bucket {
-	bucket, err := ConnectToBucket(base.BucketSpec{
-		Server:     kTestURL,
-		BucketName: "sync_gateway_tests"}, nil)
-	if err != nil {
-		log.Fatalf("Couldn't connect to bucket: %v", err)
-	}
-	return bucket
+type UnitTestAuth struct {
+	Username   string
+	Password   string
+	Bucketname string
+}
+
+func (u *UnitTestAuth) GetCredentials() (string, string, string) {
+	return base.TransformBucketCredentials(u.Username, u.Password, u.Bucketname)
 }
 
 func testLeakyBucket(config base.LeakyBucketConfig) base.Bucket {
-	testBucket := testBucket()
-	leakyBucket := base.NewLeakyBucket(testBucket, config)
-	return leakyBucket
-}
 
-func setupTestDB(t *testing.T) *Database {
-	return setupTestDBWithCacheOptions(t, CacheOptions{})
+	testBucket := testBucket()
+	// Since this doesn't return the testbucket handle, disable the "open bucket counting system" by immediately
+	// decrementing counter
+	base.DecrNumOpenBuckets(testBucket.Bucket.GetName())
+
+	leakyBucket := base.NewLeakyBucket(testBucket.Bucket, config)
+	return leakyBucket
 }
 
 func setupTestDBForShadowing(t *testing.T) *Database {
 	dbcOptions := DatabaseContextOptions{
 		TrackDocs: true,
 	}
-	context, err := NewDatabaseContext("db", testBucket(), false, dbcOptions)
+	AddOptionsFromEnvironmentVariables(&dbcOptions)
+	tBucket := testBucket()
+	// Since the handle to the test bucket is getting lost, immediately decrement to disable open bucket counting
+	base.DecrNumOpenBuckets(tBucket.Bucket.GetName())
+	context, err := NewDatabaseContext("db", tBucket.Bucket, false, dbcOptions)
 	assertNoError(t, err, "Couldn't create context for database 'db'")
 	db, err := CreateDatabase(context)
 	assertNoError(t, err, "Couldn't create database 'db'")
 	return db
 }
 
-func setupTestDBWithCacheOptions(t *testing.T, options CacheOptions) *Database {
+// Its important to call tearDownTestDB() on the database and .Close() on the TestBucket that is returned by this helper.
+// For example, if .Close() is not called on the TestBucket before the test is finished, it will be detected and
+// the next test will fail.
+func setupTestDB(t testing.TB) (*Database, base.TestBucket) {
+	return setupTestDBWithCacheOptions(t, CacheOptions{})
+}
+
+func setupTestDBWithCacheOptions(t testing.TB, options CacheOptions) (*Database, base.TestBucket) {
 
 	dbcOptions := DatabaseContextOptions{
 		CacheOptions: &options,
 	}
-	context, err := NewDatabaseContext("db", testBucket(), false, dbcOptions)
+	AddOptionsFromEnvironmentVariables(&dbcOptions)
+	tBucket := testBucket()
+	context, err := NewDatabaseContext("db", tBucket.Bucket, false, dbcOptions)
 	assertNoError(t, err, "Couldn't create context for database 'db'")
 	db, err := CreateDatabase(context)
 	assertNoError(t, err, "Couldn't create database 'db'")
-	return db
+	return db, tBucket
+}
+
+func testBucket() base.TestBucket {
+
+	spec := base.GetTestBucketSpec(base.DataBucket)
+	testBucket := base.GetTestBucketOrPanic()
+	bucket := testBucket.Bucket
+	err := installViews(bucket, spec.UseXattrs)
+	if err != nil {
+		log.Fatalf("Couldn't connect to bucket: %v", err)
+	}
+	return testBucket
 }
 
 func setupTestLeakyDBWithCacheOptions(t *testing.T, options CacheOptions, leakyOptions base.LeakyBucketConfig) *Database {
 	dbcOptions := DatabaseContextOptions{
 		CacheOptions: &options,
 	}
-	context, err := NewDatabaseContext("db", testLeakyBucket(leakyOptions), false, dbcOptions)
+	AddOptionsFromEnvironmentVariables(&dbcOptions)
+	leakyBucket := testLeakyBucket(leakyOptions)
+	context, err := NewDatabaseContext("db", leakyBucket, false, dbcOptions)
 	assertNoError(t, err, "Couldn't create context for database 'db'")
 	db, err := CreateDatabase(context)
 	assertNoError(t, err, "Couldn't create database 'db'")
 	return db
 }
 
-func tearDownTestDB(t *testing.T, db *Database) {
+// If certain environemnt variables are set, for example to turn on XATTR support, then update
+// the DatabaseContextOptions accordingly
+func AddOptionsFromEnvironmentVariables(dbcOptions *DatabaseContextOptions) {
+
+	if base.TestUseXattrs() {
+		dbcOptions.EnableXattr = true
+	}
+
+}
+
+func tearDownTestDB(t testing.TB, db *Database) {
 	db.Close()
 }
 
@@ -102,7 +139,9 @@ func assertHTTPError(t *testing.T, err error, status int) {
 }
 
 func TestDatabase(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Test creating & updating a document:
@@ -145,7 +184,7 @@ func TestDatabase(t *testing.T) {
 	// Test the _revisions property:
 	log.Printf("Check _revisions...")
 	gotbody, err = db.GetRev("doc1", rev2id, true, nil)
-	revisions := gotbody["_revisions"].(Body)
+	revisions := gotbody["_revisions"].(map[string]interface{})
 	assert.Equals(t, revisions["start"], 2)
 	assert.DeepEquals(t, revisions["ids"],
 		[]string{"488724414d0ed6b398d6d2aeb228d797",
@@ -188,14 +227,12 @@ func TestDatabase(t *testing.T) {
 	assertNoError(t, err, "Couldn't get document")
 	assert.DeepEquals(t, gotbody, body)
 
-	// Compact and check how many obsolete revs were deleted:
-	revsDeleted, err := db.Compact()
-	assertNoError(t, err, "Compact failed")
-	assert.Equals(t, revsDeleted, 2)
 }
 
 func TestGetDeleted(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	body := Body{"key1": 1234}
@@ -212,9 +249,14 @@ func TestGetDeleted(t *testing.T) {
 		"_id":        "doc1",
 		"_rev":       rev2id,
 		"_deleted":   true,
-		"_revisions": Body{"start": 2, "ids": []string{"bc6d97f6e97c0d034a34f8aac2bf8b44", "dfd5e19813767eeddd08270fc5f385cd"}},
+		"_revisions": map[string]interface{}{"start": 2, "ids": []string{"bc6d97f6e97c0d034a34f8aac2bf8b44", "dfd5e19813767eeddd08270fc5f385cd"}},
 	}
 	assert.DeepEquals(t, body, expectedResult)
+
+	// Get the raw doc and make sure the sync data has the current revision
+	doc, err := db.GetDocument("doc1", DocUnmarshalAll)
+	assertNoError(t, err, "Err getting doc")
+	assert.Equals(t, doc.syncData.CurrentRev, rev2id)
 
 	// Try again but with a user who doesn't have access to this revision (see #179)
 	authenticator := auth.NewAuthenticator(db.Bucket, db)
@@ -225,6 +267,241 @@ func TestGetDeleted(t *testing.T) {
 	body, err = db.GetRev("doc1", rev2id, true, nil)
 	assertNoError(t, err, "GetRev")
 	assert.DeepEquals(t, body, expectedResult)
+}
+
+// Test retrieval of a channel removal revision, when the revision is not otherwise available
+func TestGetRemovedAsUser(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	rev1body := Body{
+		"key1":     1234,
+		"channels": []string{"ABC"},
+	}
+	rev1id, err := db.Put("doc1", rev1body)
+	assertNoError(t, err, "Put")
+
+	rev2body := Body{
+		"key1":     1234,
+		"channels": []string{"NBC"},
+		"_rev":     rev1id,
+	}
+	rev2id, err := db.Put("doc1", rev2body)
+	assertNoError(t, err, "Put Rev 2")
+
+	// Add another revision, so that rev 2 is obsolete
+	rev3body := Body{
+		"key1":     12345,
+		"channels": []string{"NBC"},
+		"_rev":     rev2id,
+	}
+	_, err = db.Put("doc1", rev3body)
+	assertNoError(t, err, "Put Rev 3")
+
+	// Get the deleted doc with its history; equivalent to GET with ?revs=true, while still resident in the rev cache
+	body, err := db.GetRev("doc1", rev2id, true, nil)
+	assertNoError(t, err, "GetRev")
+	rev2digest := rev2id[2:]
+	rev1digest := rev1id[2:]
+	expectedResult := Body{
+		"key1":     1234,
+		"channels": []string{"NBC"},
+		"_revisions": map[string]interface{}{
+			"start": 2,
+			"ids":   []string{rev2digest, rev1digest}},
+		"_id":  "doc1",
+		"_rev": rev2id,
+	}
+	assert.DeepEquals(t, body, expectedResult)
+
+	// Manually remove the temporary backup doc from the bucket
+	// Manually flush the rev cache
+	// After expiry from the rev cache and removal of doc backup, try again
+	db.DatabaseContext.revisionCache = NewRevisionCache(KDefaultRevisionCacheCapacity, db.DatabaseContext.revCacheLoader)
+	err = db.purgeOldRevisionJSON("doc1", rev2id)
+	assertNoError(t, err, "Purge old revision JSON")
+
+	// Try again with a user who doesn't have access to this revision
+	authenticator := auth.NewAuthenticator(db.Bucket, db)
+	db.user, err = authenticator.GetUser("")
+	assertNoError(t, err, "GetUser")
+
+	var chans channels.TimedSet
+	chans = channels.AtSequence(base.SetOf("ABC"), 1)
+	db.user.SetExplicitChannels(chans)
+
+	// Get the removal revision with its history; equivalent to GET with ?revs=true
+	body, err = db.GetRev("doc1", rev2id, true, nil)
+	assertNoError(t, err, "GetRev")
+	expectedResult = Body{
+		"_id":      "doc1",
+		"_rev":     rev2id,
+		"_removed": true,
+		"_revisions": map[string]interface{}{
+			"start": 2,
+			"ids":   []string{rev2digest, rev1digest}},
+	}
+	assert.DeepEquals(t, body, expectedResult)
+
+	// Ensure revision is unavailable for a non-leaf revision that isn't available via the rev cache, and wasn't a channel removal
+	err = db.purgeOldRevisionJSON("doc1", rev1id)
+	assertNoError(t, err, "Purge old revision JSON")
+
+	_, err = db.GetRev("doc1", rev1id, true, nil)
+	assertHTTPError(t, err, 404)
+}
+
+// Test retrieval of a channel removal revision, when the revision is not otherwise available
+func TestGetRemoved(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	rev1body := Body{
+		"key1":     1234,
+		"channels": []string{"ABC"},
+	}
+	rev1id, err := db.Put("doc1", rev1body)
+	assertNoError(t, err, "Put")
+
+	rev2body := Body{
+		"key1":     1234,
+		"channels": []string{"NBC"},
+		"_rev":     rev1id,
+	}
+	rev2id, err := db.Put("doc1", rev2body)
+	assertNoError(t, err, "Put Rev 2")
+
+	// Add another revision, so that rev 2 is obsolete
+	rev3body := Body{
+		"key1":     12345,
+		"channels": []string{"NBC"},
+		"_rev":     rev2id,
+	}
+	_, err = db.Put("doc1", rev3body)
+	assertNoError(t, err, "Put Rev 3")
+
+	// Get the deleted doc with its history; equivalent to GET with ?revs=true, while still resident in the rev cache
+	body, err := db.GetRev("doc1", rev2id, true, nil)
+	assertNoError(t, err, "GetRev")
+	rev2digest := rev2id[2:]
+	rev1digest := rev1id[2:]
+	expectedResult := Body{
+		"key1":     1234,
+		"channels": []string{"NBC"},
+		"_revisions": map[string]interface{}{
+			"start": 2,
+			"ids":   []string{rev2digest, rev1digest}},
+		"_id":  "doc1",
+		"_rev": rev2id,
+	}
+	assert.DeepEquals(t, body, expectedResult)
+
+	// Manually remove the temporary backup doc from the bucket
+	// Manually flush the rev cache
+	// After expiry from the rev cache and removal of doc backup, try again
+	db.DatabaseContext.revisionCache = NewRevisionCache(KDefaultRevisionCacheCapacity, db.DatabaseContext.revCacheLoader)
+	err = db.purgeOldRevisionJSON("doc1", rev2id)
+	assertNoError(t, err, "Purge old revision JSON")
+
+	// Get the removal revision with its history; equivalent to GET with ?revs=true
+	body, err = db.GetRev("doc1", rev2id, true, nil)
+	assertNoError(t, err, "GetRev")
+	expectedResult = Body{
+		"_id":      "doc1",
+		"_rev":     rev2id,
+		"_removed": true,
+		"_revisions": map[string]interface{}{
+			"start": 2,
+			"ids":   []string{rev2digest, rev1digest}},
+	}
+	assert.DeepEquals(t, body, expectedResult)
+
+	// Ensure revision is unavailable for a non-leaf revision that isn't available via the rev cache, and wasn't a channel removal
+	err = db.purgeOldRevisionJSON("doc1", rev1id)
+	assertNoError(t, err, "Purge old revision JSON")
+
+	_, err = db.GetRev("doc1", rev1id, true, nil)
+	assertHTTPError(t, err, 404)
+}
+
+// Test retrieval of a channel removal revision, when the revision is not otherwise available
+func TestGetRemovedAndDeleted(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	rev1body := Body{
+		"key1":     1234,
+		"channels": []string{"ABC"},
+	}
+	rev1id, err := db.Put("doc1", rev1body)
+	assertNoError(t, err, "Put")
+
+	rev2body := Body{
+		"key1":     1234,
+		"_deleted": true,
+		"_rev":     rev1id,
+	}
+	rev2id, err := db.Put("doc1", rev2body)
+	assertNoError(t, err, "Put Rev 2")
+
+	// Add another revision, so that rev 2 is obsolete
+	rev3body := Body{
+		"key1":     12345,
+		"channels": []string{"NBC"},
+		"_rev":     rev2id,
+	}
+	_, err = db.Put("doc1", rev3body)
+	assertNoError(t, err, "Put Rev 3")
+
+	// Get the deleted doc with its history; equivalent to GET with ?revs=true, while still resident in the rev cache
+	body, err := db.GetRev("doc1", rev2id, true, nil)
+	assertNoError(t, err, "GetRev")
+	rev2digest := rev2id[2:]
+	rev1digest := rev1id[2:]
+	expectedResult := Body{
+		"key1":     1234,
+		"_deleted": true,
+		"_revisions": map[string]interface{}{
+			"start": 2,
+			"ids":   []string{rev2digest, rev1digest}},
+		"_id":  "doc1",
+		"_rev": rev2id,
+	}
+	assert.DeepEquals(t, body, expectedResult)
+
+	// Manually remove the temporary backup doc from the bucket
+	// Manually flush the rev cache
+	// After expiry from the rev cache and removal of doc backup, try again
+	db.DatabaseContext.revisionCache = NewRevisionCache(KDefaultRevisionCacheCapacity, db.DatabaseContext.revCacheLoader)
+	err = db.purgeOldRevisionJSON("doc1", rev2id)
+	assertNoError(t, err, "Purge old revision JSON")
+
+	// Get the deleted doc with its history; equivalent to GET with ?revs=true
+	body, err = db.GetRev("doc1", rev2id, true, nil)
+	assertNoError(t, err, "GetRev")
+	expectedResult = Body{
+		"_id":      "doc1",
+		"_rev":     rev2id,
+		"_removed": true,
+		"_deleted": true,
+		"_revisions": map[string]interface{}{
+			"start": 2,
+			"ids":   []string{rev2digest, rev1digest}},
+	}
+	assert.DeepEquals(t, body, expectedResult)
+
+	// Ensure revision is unavailable for a non-leaf revision that isn't available via the rev cache, and wasn't a channel removal
+	err = db.purgeOldRevisionJSON("doc1", rev1id)
+	assertNoError(t, err, "Purge old revision JSON")
+
+	_, err = db.GetRev("doc1", rev1id, true, nil)
+	assertHTTPError(t, err, 404)
 }
 
 type AllDocsEntry struct {
@@ -250,25 +527,15 @@ func allDocIDs(db *Database) (docs []AllDocsEntry, err error) {
 	return
 }
 
-func TestAllDocs(t *testing.T) {
-	// base.LogKeys["Cache"] = true
-	// base.LogKeys["Changes"] = true
-	db := setupTestDB(t)
+func TestAllDocsOnly(t *testing.T) {
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Lower the log expiration time to zero so no more than 50 items will be kept.
 	oldChannelCacheAge := DefaultChannelCacheAge
 	DefaultChannelCacheAge = 0
 	defer func() { DefaultChannelCacheAge = oldChannelCacheAge }()
-
-	/*
-		base.LogKeys["Changes"] = true
-		base.LogKeys["Changes+"] = true
-		defer func() {
-			base.LogKeys["Changes"] = false
-			base.LogKeys["Changes+"] = false
-		}()
-	*/
 
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
 
@@ -278,7 +545,7 @@ func TestAllDocs(t *testing.T) {
 		if i%10 == 0 {
 			channels = append(channels, "KFJC")
 		}
-		body := Body{"serialnumber": i, "channels": channels}
+		body := Body{"serialnumber": int64(i), "channels": channels}
 		ids[i].DocID = fmt.Sprintf("alldoc-%02d", i)
 		revid, err := db.Put(ids[i].DocID, body)
 		ids[i].RevID = revid
@@ -312,9 +579,9 @@ func TestAllDocs(t *testing.T) {
 	// Inspect the channel log to confirm that it's only got the last 50 sequences.
 	// There are 101 sequences overall, so the 1st one it has should be #52.
 	db.changeCache.waitForSequence(101)
-	log := db.GetChangeLog("all", 0)
-	assert.Equals(t, len(log), 50)
-	assert.Equals(t, int(log[0].Sequence), 52)
+	changeLog := db.GetChangeLog("all", 0)
+	assert.Equals(t, len(changeLog), 50)
+	assert.Equals(t, int(changeLog[0].Sequence), 52)
 
 	// Now check the changes feed:
 	var options ChangesOptions
@@ -346,6 +613,8 @@ func TestAllDocs(t *testing.T) {
 		assert.Equals(t, change.ID, ids[10*i].DocID)
 		assert.Equals(t, change.Deleted, false)
 		assert.DeepEquals(t, change.Removed, base.Set(nil))
+		// Note: When changes uses the rev cache, this test doesn't trigger FixJSONNumbers (since it writes docs as Body, not raw JSON,
+		//       and doesn't require a read from DB)
 		assert.Equals(t, change.Doc["serialnumber"], int64(10*i))
 	}
 }
@@ -361,8 +630,10 @@ func TestUpdatePrincipal(t *testing.T) {
 
 	base.UpdateLogKeys(logKeys, true)
 
-	db := setupTestDB(t)
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
+
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
 
 	// Create a user with access to channel ABC
@@ -389,9 +660,50 @@ func TestUpdatePrincipal(t *testing.T) {
 	assert.Equals(t, nextSeq, uint64(3))
 }
 
-func TestConflicts(t *testing.T) {
-	db := setupTestDB(t)
+// Re-apply one of the conflicting changes to make sure that PutExistingRev() treats it as a no-op (SG Issue #3048)
+func TestRepeatedConflict(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
+
+	// Create rev 1 of "doc":
+	body := Body{"n": 1, "channels": []string{"all", "1"}}
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"1-a"}), "add 1-a")
+
+	// Create two conflicting changes:
+	body["n"] = 2
+	body["channels"] = []string{"all", "2b"}
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"2-b", "1-a"}), "add 2-b")
+
+	body["n"] = 3
+	body["channels"] = []string{"all", "2a"}
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"2-a", "1-a"}), "add 2-a")
+
+	// Get the _rev that was set in the body by PutExistingRev() and make assertions on it
+	rev, ok := body["_rev"]
+	assert.True(t, ok)
+	revGen, _ := ParseRevID(rev.(string))
+	assert.Equals(t, revGen, 2)
+
+	// Remove the _rev key from the body, and call PutExistingRev() again, which should re-add it
+	delete(body, "_rev")
+	db.PutExistingRev("doc", body, []string{"2-a", "1-a"})
+
+	// The _rev should pass the same assertions as before, since PutExistingRev() should re-add it
+	rev, ok = body["_rev"]
+	assert.True(t, ok)
+	revGen, _ = ParseRevID(rev.(string))
+	assert.Equals(t, revGen, 2)
+
+}
+
+func TestConflicts(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
 
 	/*
@@ -408,10 +720,10 @@ func TestConflicts(t *testing.T) {
 	body := Body{"n": 1, "channels": []string{"all", "1"}}
 	assertNoError(t, db.PutExistingRev("doc", body, []string{"1-a"}), "add 1-a")
 
-	time.Sleep(50 * time.Millisecond) // Wait for tap feed to catch up
+	time.Sleep(time.Second) // Wait for tap feed to catch up
 
-	log := db.GetChangeLog("all", 0)
-	assert.Equals(t, len(log), 1)
+	changeLog := db.GetChangeLog("all", 0)
+	assert.Equals(t, len(changeLog), 1)
 
 	// Create two conflicting changes:
 	body["n"] = 2
@@ -421,12 +733,16 @@ func TestConflicts(t *testing.T) {
 	body["channels"] = []string{"all", "2a"}
 	assertNoError(t, db.PutExistingRev("doc", body, []string{"2-a", "1-a"}), "add 2-a")
 
-	time.Sleep(50 * time.Millisecond) // Wait for tap feed to catch up
+	time.Sleep(time.Second) // Wait for tap feed to catch up
+
+	rawBody, _, _ := db.Bucket.GetRaw("doc")
+
+	log.Printf("got raw body: %s", rawBody)
 
 	// Verify the change with the higher revid won:
 	gotBody, err := db.Get("doc")
-	assert.DeepEquals(t, gotBody, Body{"_id": "doc", "_rev": "2-b", "n": int64(2),
-		"channels": []interface{}{"all", "2b"}})
+	assert.DeepEquals(t, gotBody, Body{"_id": "doc", "_rev": "2-b", "n": 2,
+		"channels": []string{"all", "2b"}})
 
 	// Verify we can still get the other two revisions:
 	gotBody, err = db.GetRev("doc", "1-a", false, nil)
@@ -438,12 +754,12 @@ func TestConflicts(t *testing.T) {
 
 	// Verify the change-log of the "all" channel:
 	db.changeCache.waitForSequence(3)
-	log = db.GetChangeLog("all", 0)
-	assert.Equals(t, len(log), 1)
-	assert.Equals(t, log[0].Sequence, uint64(3))
-	assert.Equals(t, log[0].DocID, "doc")
-	assert.Equals(t, log[0].RevID, "2-b")
-	assert.Equals(t, log[0].Flags, uint8(channels.Hidden|channels.Branched|channels.Conflict))
+	changeLog = db.GetChangeLog("all", 0)
+	assert.Equals(t, len(changeLog), 1)
+	assert.Equals(t, changeLog[0].Sequence, uint64(3))
+	assert.Equals(t, changeLog[0].DocID, "doc")
+	assert.Equals(t, changeLog[0].RevID, "2-b")
+	assert.Equals(t, changeLog[0].Flags, uint8(channels.Hidden|channels.Branched|channels.Conflict))
 
 	// Verify the _changes feed:
 	options := ChangesOptions{
@@ -461,12 +777,16 @@ func TestConflicts(t *testing.T) {
 	// Delete 2-b; verify this makes 2-a current:
 	rev3, err := db.DeleteDoc("doc", "2-b")
 	assertNoError(t, err, "delete 2-b")
+
+	rawBody, _, _ = db.Bucket.GetRaw("doc")
+	log.Printf("post-delete, got raw body: %s", rawBody)
+
 	gotBody, err = db.Get("doc")
-	assert.DeepEquals(t, gotBody, Body{"_id": "doc", "_rev": "2-a", "n": int64(3),
-		"channels": []interface{}{"all", "2a"}})
+	assert.DeepEquals(t, gotBody, Body{"_id": "doc", "_rev": "2-a", "n": 3,
+		"channels": []string{"all", "2a"}})
 
 	// Verify channel assignments are correct for channels defined by 2-a:
-	doc, _ := db.GetDoc("doc")
+	doc, _ := db.GetDocument("doc", DocUnmarshalAll)
 	chan2a, found := doc.Channels["2a"]
 	assert.True(t, found)
 	assert.True(t, chan2a == nil)             // currently in 2a
@@ -484,8 +804,137 @@ func TestConflicts(t *testing.T) {
 		branched: true})
 }
 
+func TestNoConflictsMode(t *testing.T) {
+
+	db, testBucket := setupTestDB(t)
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+	// Strictly speaking, this flag should be set before opening the database, but it only affects
+	// Put operations and replication, so it doesn't make a difference if we do it afterwards.
+	db.Options.UnsupportedOptions.AllowConflicts = base.BooleanPointer(false)
+
+	/*
+		var logKeys = map[string]bool {
+			"Cache": true,
+			"Changes": true,
+			"Changes+": true,
+		}
+
+		base.UpdateLogKeys(logKeys, true)
+	*/
+
+	// Create revs 1 and 2 of "doc":
+	body := Body{"n": 1, "channels": []string{"all", "1"}}
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"1-a"}), "add 1-a")
+	body["n"] = 2
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"2-a", "1-a"}), "add 2-a")
+
+	// Try to create a conflict branching from rev 1:
+	err := db.PutExistingRev("doc", body, []string{"2-b", "1-a"})
+	assertHTTPError(t, err, 409)
+
+	// Try to create a conflict with no common ancestor:
+	err = db.PutExistingRev("doc", body, []string{"2-c", "1-c"})
+	assertHTTPError(t, err, 409)
+
+	// Try to create a conflict with a longer history:
+	err = db.PutExistingRev("doc", body, []string{"4-d", "3-d", "2-d", "1-a"})
+	assertHTTPError(t, err, 409)
+
+	// Try to create a conflict with no history:
+	err = db.PutExistingRev("doc", body, []string{"1-e"})
+	assertHTTPError(t, err, 409)
+
+	// Create a non-conflict with a longer history, ending in a deletion:
+	body["_deleted"] = true
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"4-a", "3-a", "2-a", "1-a"}), "add 4-a")
+	delete(body, "_deleted")
+
+	// Create a non-conflict with no history (re-creating the document, but with an invalid rev):
+	err = db.PutExistingRev("doc", body, []string{"1-f"})
+	assertHTTPError(t, err, 409)
+
+	// Resurrect the tombstoned document with a valid history
+	assertNoError(t, db.PutExistingRev("doc", body, []string{"5-f", "4-a"}), "add 5-f")
+	delete(body, "_deleted")
+
+	// Create a new document with a longer history:
+	assertNoError(t, db.PutExistingRev("COD", body, []string{"4-a", "3-a", "2-a", "1-a"}), "add COD")
+	delete(body, "_deleted")
+
+	// Now use Put instead of PutExistingRev:
+
+	// Successfully add a new revision:
+	_, err = db.Put("doc", Body{"_rev": "5-f", "foo": -1})
+	assertNoError(t, err, "Put rev after 1-f")
+
+	// Try to create a conflict:
+	_, err = db.Put("doc", Body{"_rev": "3-a", "foo": 7})
+	assertHTTPError(t, err, 409)
+
+	// Conflict with no ancestry:
+	_, err = db.Put("doc", Body{"foo": 7})
+	assertHTTPError(t, err, 409)
+}
+
+// Test tombstoning of existing conflicts after AllowConflicts is set to false
+func TestAllowConflictsFalseTombstoneExistingConflict(t *testing.T) {
+	db, testBucket := setupTestDB(t)
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	// Create documents with multiple non-deleted branches
+	log.Printf("Creating docs")
+	body := Body{"n": 1}
+	assertNoError(t, db.PutExistingRev("doc1", body, []string{"1-a"}), "add 1-a")
+	assertNoError(t, db.PutExistingRev("doc2", body, []string{"1-a"}), "add 1-a")
+	assertNoError(t, db.PutExistingRev("doc3", body, []string{"1-a"}), "add 1-a")
+
+	// Create two conflicting changes:
+	body["n"] = 2
+	assertNoError(t, db.PutExistingRev("doc1", body, []string{"2-b", "1-a"}), "add 2-b")
+	assertNoError(t, db.PutExistingRev("doc2", body, []string{"2-b", "1-a"}), "add 2-b")
+	assertNoError(t, db.PutExistingRev("doc3", body, []string{"2-b", "1-a"}), "add 2-b")
+	body["n"] = 3
+	assertNoError(t, db.PutExistingRev("doc1", body, []string{"2-a", "1-a"}), "add 2-a")
+	assertNoError(t, db.PutExistingRev("doc2", body, []string{"2-a", "1-a"}), "add 2-a")
+	assertNoError(t, db.PutExistingRev("doc3", body, []string{"2-a", "1-a"}), "add 2-a")
+
+	// Set AllowConflicts to false
+	db.Options.UnsupportedOptions.AllowConflicts = base.BooleanPointer(false)
+	delete(body, "n")
+	body["_deleted"] = true
+
+	// Attempt to tombstone a non-leaf node of a conflicted document
+	err := db.PutExistingRev("doc1", body, []string{"2-c", "1-a"})
+	assertTrue(t, err != nil, "expected error tombstoning non-leaf")
+
+	// Tombstone the non-winning branch of a conflicted document
+	assertNoError(t, db.PutExistingRev("doc1", body, []string{"3-a", "2-a"}), "add 3-a (tombstone)")
+	doc, err := db.GetDocument("doc1", DocUnmarshalAll)
+	assertNoError(t, err, "Retrieve doc post-tombstone")
+	assert.Equals(t, doc.CurrentRev, "2-b")
+
+	// Tombstone the winning branch of a conflicted document
+	assertNoError(t, db.PutExistingRev("doc2", body, []string{"3-b", "2-b"}), "add 3-b (tombstone)")
+	doc, err = db.GetDocument("doc2", DocUnmarshalAll)
+	assertNoError(t, err, "Retrieve doc post-tombstone")
+	assert.Equals(t, doc.CurrentRev, "2-a")
+
+	// Set revs_limit=1, then tombstone non-winning branch of a conflicted document.  Validate retrieval still works.
+	db.RevsLimit = uint32(1)
+	assertNoError(t, db.PutExistingRev("doc3", body, []string{"3-a", "2-a"}), "add 3-a (tombstone)")
+	doc, err = db.GetDocument("doc3", DocUnmarshalAll)
+	assertNoError(t, err, "Retrieve doc post-tombstone")
+	assert.Equals(t, doc.CurrentRev, "2-b")
+
+	log.Printf("tombstoned conflicts: %+v", doc)
+}
+
 func TestSyncFnOnPush(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	db.ChannelMapper = channels.NewChannelMapper(`function(doc, oldDoc) {
@@ -512,7 +961,7 @@ func TestSyncFnOnPush(t *testing.T) {
 	assertNoError(t, err, "PutExistingRev failed")
 
 	// Check that the doc has the correct channel (test for issue #300)
-	doc, err := db.GetDoc("doc1")
+	doc, err := db.GetDocument("doc1", DocUnmarshalAll)
 	assert.DeepEquals(t, doc.Channels, channels.ChannelMap{
 		"clibup": nil, // i.e. it is currently in this channel (no removal)
 		"public": &channels.ChannelRemoval{Seq: 2, RevID: "4-four"},
@@ -521,7 +970,9 @@ func TestSyncFnOnPush(t *testing.T) {
 }
 
 func TestInvalidChannel(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
@@ -532,7 +983,9 @@ func TestInvalidChannel(t *testing.T) {
 }
 
 func TestAccessFunctionValidation(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	var err error
@@ -574,7 +1027,8 @@ func TestAccessFunction(t *testing.T) {
 		base.UpdateLogKeys(logKeys, true)
 	*/
 
-	db := setupTestDB(t)
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	authenticator := auth.NewAuthenticator(db.Bucket, db)
@@ -612,7 +1066,8 @@ func CouchbaseTestAccessFunctionWithVbuckets(t *testing.T) {
 	//base.LogKeys["CRUD"] = true
 	//base.LogKeys["Access"] = true
 
-	db := setupTestDB(t)
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	db.SequenceType = ClockSequenceType
@@ -668,25 +1123,49 @@ func TestDocIDs(t *testing.T) {
 }
 
 func TestUpdateDesignDoc(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
-	err := db.PutDesignDoc("official", DesignDoc{})
+	mapFunction := `function (doc, meta) { emit(); }`
+	err := db.PutDesignDoc("official", sgbucket.DesignDoc{
+		Views: sgbucket.ViewMap{
+			"TestView": sgbucket.ViewDef{Map: mapFunction},
+		},
+	})
 	assertNoError(t, err, "add design doc as admin")
 
 	// Validate retrieval of the design doc by admin
-	var result DesignDoc
+	var result sgbucket.DesignDoc
 	err = db.GetDesignDoc("official", &result)
+	log.Printf("design doc: %+v", result)
+
+	// Try to retrieve it as an empty interface as well, and make sure no errors
+	var resultEmptyInterface interface{}
+	err = db.GetDesignDoc("official", &resultEmptyInterface)
+	assertNoError(t, err, "retrieve design doc (empty interface) as admin")
+
 	assertNoError(t, err, "retrieve design doc as admin")
+	retrievedView, ok := result.Views["TestView"]
+	assert.True(t, ok)
+	assert.True(t, strings.Contains(retrievedView.Map, "emit()"))
+	assert.NotEquals(t, retrievedView.Map, mapFunction) // SG should wrap the map function, so they shouldn't be equal
 
 	authenticator := auth.NewAuthenticator(db.Bucket, db)
 	db.user, _ = authenticator.NewUser("naomi", "letmein", channels.SetOf("Netflix"))
-	err = db.PutDesignDoc("_design/pwn3d", DesignDoc{})
+	err = db.PutDesignDoc("_design/pwn3d", sgbucket.DesignDoc{})
 	assertHTTPError(t, err, 403)
 }
 
-func TestImport(t *testing.T) {
-	db := setupTestDB(t)
+func TestLegacyImport(t *testing.T) {
+
+	if base.TestUseXattrs() {
+		t.Skip("This test should not be run in XATTR mode.  Skipping")
+	}
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Add docs to the underlying bucket:
@@ -695,7 +1174,7 @@ func TestImport(t *testing.T) {
 	}
 
 	// Make sure they aren't visible thru the gateway:
-	doc, err := db.GetDoc("alreadyHere1")
+	doc, err := db.GetDocument("alreadyHere1", DocUnmarshalAll)
 	assert.Equals(t, doc, (*document)(nil))
 	assert.Equals(t, err.(*base.HTTPError).Status, 404)
 
@@ -705,14 +1184,16 @@ func TestImport(t *testing.T) {
 	assert.Equals(t, count, 20)
 
 	// Now they're visible:
-	doc, err = db.GetDoc("alreadyHere1")
+	doc, err = db.GetDocument("alreadyHere1", DocUnmarshalAll)
 	base.Logf("doc = %+v", doc)
 	assert.True(t, doc != nil)
 	assertNoError(t, err, "can't get doc")
 }
 
 func TestPostWithExistingId(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Test creating a document with existing id property:
@@ -725,7 +1206,7 @@ func TestPostWithExistingId(t *testing.T) {
 	assertNoError(t, err, "Couldn't create document")
 
 	// Test retrieval
-	doc, err := db.GetDoc(customDocId)
+	doc, err := db.GetDocument(customDocId, DocUnmarshalAll)
 	assert.True(t, doc != nil)
 	assertNoError(t, err, "Unable to retrieve doc using custom id")
 
@@ -738,7 +1219,7 @@ func TestPostWithExistingId(t *testing.T) {
 	assertNoError(t, err, "Couldn't create document")
 
 	// Test retrieval
-	doc, err = db.GetDoc(docid)
+	doc, err = db.GetDocument(docid, DocUnmarshalAll)
 	assert.True(t, doc != nil)
 	assertNoError(t, err, "Unable to retrieve doc using generated uuid")
 
@@ -746,7 +1227,9 @@ func TestPostWithExistingId(t *testing.T) {
 
 // Unit test for issue #507
 func TestPutWithUserSpecialProperty(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Test creating a document with existing id property:
@@ -761,7 +1244,9 @@ func TestPutWithUserSpecialProperty(t *testing.T) {
 
 // Unit test for issue #976
 func TestWithNullPropertyKey(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Test creating a document with null property key
@@ -775,7 +1260,9 @@ func TestWithNullPropertyKey(t *testing.T) {
 
 // Unit test for issue #507
 func TestPostWithUserSpecialProperty(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	// Test creating a document with existing id property:
@@ -788,7 +1275,7 @@ func TestPostWithUserSpecialProperty(t *testing.T) {
 	assertNoError(t, err, "Couldn't create document")
 
 	// Test retrieval
-	doc, err := db.GetDoc(customDocId)
+	doc, err := db.GetDocument(customDocId, DocUnmarshalAll)
 	assert.True(t, doc != nil)
 	assertNoError(t, err, "Unable to retrieve doc using custom id")
 
@@ -800,7 +1287,7 @@ func TestPostWithUserSpecialProperty(t *testing.T) {
 	assert.True(t, err.Error() == "400 user defined top level properties beginning with '_' are not allowed in document body")
 
 	// Test retrieval gets rev1
-	doc, err = db.GetDoc(docid)
+	doc, err = db.GetDocument(docid, DocUnmarshalAll)
 	assert.True(t, doc != nil)
 	assert.True(t, doc.CurrentRev == rev1id)
 	assertNoError(t, err, "Unable to retrieve doc using generated uuid")
@@ -819,7 +1306,7 @@ func TestIncrRetrySuccess(t *testing.T) {
 
 }
 
-func TestIncrRetryFail(t *testing.T) {
+func TestIncrRetryUnsuccessful(t *testing.T) {
 	leakyBucketConfig := base.LeakyBucketConfig{
 		IncrTemporaryFailCount: 10,
 	}
@@ -833,38 +1320,45 @@ func TestIncrRetryFail(t *testing.T) {
 }
 
 func TestRecentSequenceHistory(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
+
+	seqTracker := uint64(0)
 
 	// Validate recent sequence is written
 	body := Body{"val": "one"}
 	revid, err := db.Put("doc1", body)
+	seqTracker++
 
+	expectedRecent := make([]uint64, 0)
 	assert.True(t, revid != "")
-	doc, err := db.GetDoc("doc1")
+	doc, err := db.GetDocument("doc1", DocUnmarshalAll)
+	expectedRecent = append(expectedRecent, seqTracker)
 	assert.True(t, err == nil)
-	assert.DeepEquals(t, doc.RecentSequences, []uint64{1})
+	assert.DeepEquals(t, doc.RecentSequences, expectedRecent)
 
-	// Add a few revisions - validate they are retained when less than max (20)
-	for i := 0; i < 3; i++ {
+	// Add up to kMaxRecentSequences revisions - validate they are retained when total is less than max
+	for i := 1; i < kMaxRecentSequences; i++ {
 		revid, err = db.Put("doc1", body)
+		seqTracker++
+		expectedRecent = append(expectedRecent, seqTracker)
 	}
 
-	doc, err = db.GetDoc("doc1")
+	doc, err = db.GetDocument("doc1", DocUnmarshalAll)
 	assert.True(t, err == nil)
-	assert.DeepEquals(t, doc.RecentSequences, []uint64{1, 2, 3, 4})
+	assert.DeepEquals(t, doc.RecentSequences, expectedRecent)
 
-	// Add many sequences to validate pruning when past max (20)
-	for i := 0; i < kMaxRecentSequences; i++ {
-		revid, err = db.Put("doc1", body)
-		// Sleep needed to ensure consistent results when running single-threaded vs. multi-threaded test:
-		// without it we can't predict the relative update times of nextSequence and RecentSequences
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Recent sequence pruning only prunes entries older than what's been seen over DCP
+	// (to ensure it's not pruning something that may still be coalesced).  Because of this, test waits
+	// for caching before attempting to trigger pruning.
+	db.changeCache.waitForSequence(seqTracker)
 
-	db.changeCache.waitForSequence(24)
+	// Add another sequence to validate pruning when past max (20)
 	revid, err = db.Put("doc1", body)
-	doc, err = db.GetDoc("doc1")
+	seqTracker++
+	doc, err = db.GetDocument("doc1", DocUnmarshalAll)
 	assert.True(t, err == nil)
 	log.Printf("recent:%d, max:%d", len(doc.RecentSequences), kMaxRecentSequences)
 	assert.True(t, len(doc.RecentSequences) <= kMaxRecentSequences)
@@ -873,15 +1367,148 @@ func TestRecentSequenceHistory(t *testing.T) {
 	doc2Body := Body{"val": "two"}
 	for i := 0; i < kMaxRecentSequences; i++ {
 		revid, err = db.Put("doc1", body)
+		seqTracker++
 		revid, err = db.Put("doc2", doc2Body)
+		seqTracker++
 	}
 
-	db.changeCache.waitForSequence(64)
+	db.changeCache.waitForSequence(seqTracker) //
 	revid, err = db.Put("doc1", body)
-	doc, err = db.GetDoc("doc1")
+	seqTracker++
+	doc, err = db.GetDocument("doc1", DocUnmarshalAll)
 	assert.True(t, err == nil)
 	log.Printf("Recent sequences: %v (shouldn't exceed %v)", len(doc.RecentSequences), kMaxRecentSequences)
 	assert.True(t, len(doc.RecentSequences) <= kMaxRecentSequences)
+
+}
+
+func TestChannelView(t *testing.T) {
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	// Create doc
+	log.Printf("Create doc 1...")
+	body := Body{"key1": "value1", "key2": 1234}
+	rev1id, err := db.Put("doc1", body)
+	assertNoError(t, err, "Couldn't create document")
+	assert.Equals(t, rev1id, body["_rev"])
+	assert.Equals(t, rev1id, "1-cb0c9a22be0e5a1b01084ec019defa81")
+
+	var entries LogEntries
+	// Query view (retry loop to wait for indexing)
+	for i := 0; i < 10; i++ {
+		var err error
+		entries, err = db.getChangesInChannelFromView("*", 0, ChangesOptions{})
+
+		assertNoError(t, err, "Couldn't create document")
+		if len(entries) >= 1 {
+			log.Printf("View query returned entry: %+v", entries[0])
+			break
+		}
+		log.Printf("No entries found - retrying (%d/10)", i+1)
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	assert.True(t, len(entries) == 1)
+
+}
+
+//////// XATTR specific tests.  These tests current require setting DefaultUseXattrs=true, and must be run against a Couchbase bucket
+
+func CouchbaseTestConcurrentImport(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	base.EnableLogKey("Import+")
+
+	// Add doc to the underlying bucket:
+	db.Bucket.Add("directWrite", 0, Body{"value": "hi"})
+
+	// Attempt concurrent retrieval of the docs, and validate that they are only imported once (based on revid)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			doc, err := db.GetDocument("directWrite", DocUnmarshalAll)
+			assert.True(t, doc != nil)
+			assertNoError(t, err, "Document retrieval error")
+			assert.Equals(t, doc.syncData.CurrentRev, "1-36fa688dc2a2c39a952ddce46ab53d12")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestQueryAllDocs(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	viewResult, err := db.queryAllDocs(false)
+	assert.True(t, err == nil)
+	initialTotalRows := viewResult.TotalRows
+	assert.True(t, len(viewResult.Rows) == initialTotalRows)
+
+	// add some docs
+	docId := base.CreateUUID()
+	_, err = db.Put(docId, Body{"val": "one"})
+	if err != nil {
+		log.Printf("error putting doc: %v", err)
+	}
+	assert.True(t, err == nil)
+
+	// Workaround race condition where queryAllDocs doesn't return the doc we just added
+	// TODO: Since this is doing a stale=false query in queryAllDocs, is this even needed?  I believe it
+	// TODO: is needed because there might be a race between the write and when it's indexed.
+	// TODO: convert this to be event based when receiving an event over the mutation feed
+	time.Sleep(time.Second * 1)
+
+	// query all docs, should get one more doc
+	viewResult, err = db.queryAllDocs(false)
+	assert.True(t, err == nil)
+	log.Printf("viewResult.TotalRows: %v", viewResult.TotalRows)
+	assert.True(t, viewResult.TotalRows == (initialTotalRows+1))
+
+}
+
+func TestViewCustom(t *testing.T) {
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(t, db)
+
+	// add some docs
+	docId := base.CreateUUID()
+	_, err := db.Put(docId, Body{"val": "one"})
+	if err != nil {
+		log.Printf("error putting doc: %v", err)
+	}
+	assert.True(t, err == nil)
+
+	// Workaround race condition where queryAllDocs doesn't return the doc we just added
+	// TODO: Since this is doing a stale=false query in queryAllDocs, is this even needed?  I believe it
+	// TODO: is needed because there might be a race between the write and when it's indexed.
+	// TODO: convert this to be event based when receiving an event over the mutation feed
+	time.Sleep(time.Second * 1)
+
+	// query all docs using ViewCustom query.
+	opts := Body{"stale": false, "reduce": false}
+	viewResult := sgbucket.ViewResult{}
+	errViewCustom := db.Bucket.ViewCustom(DesignDocSyncHousekeeping, ViewAllDocs, opts, &viewResult)
+	assert.True(t, errViewCustom == nil)
+
+	// assert that the doc added earlier is in the results
+	foundDoc := false
+	for _, viewRow := range viewResult.Rows {
+		if viewRow.ID == docId {
+			foundDoc = true
+		}
+	}
+	assert.True(t, foundDoc)
 
 }
 
@@ -891,8 +1518,9 @@ func BenchmarkDatabase(b *testing.B) {
 	base.SetLogLevel(2) // disables logging
 	for i := 0; i < b.N; i++ {
 		bucket, _ := ConnectToBucket(base.BucketSpec{
-			Server:     kTestURL,
-			BucketName: fmt.Sprintf("b-%d", i)}, nil)
+			Server:          base.UnitTestUrl(),
+			CouchbaseDriver: base.ChooseCouchbaseDriver(base.DataBucket),
+			BucketName:      fmt.Sprintf("b-%d", i)}, nil)
 		context, _ := NewDatabaseContext("db", bucket, false, DatabaseContextOptions{})
 		db, _ := CreateDatabase(context)
 

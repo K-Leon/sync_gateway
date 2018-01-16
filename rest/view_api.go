@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/couchbase/sg-bucket"
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/db"
 )
@@ -38,7 +39,7 @@ func (h *handler) handleGetDesignDoc() error {
 // HTTP handler for PUT _design/$ddoc
 func (h *handler) handlePutDesignDoc() error {
 	ddocID := h.PathVar("ddoc")
-	var ddoc db.DesignDoc
+	var ddoc sgbucket.DesignDoc
 	err := h.readJSONInto(&ddoc)
 	if err != nil {
 		return err
@@ -61,10 +62,10 @@ func (h *handler) handleView() error {
 	// Couchbase Server view API:
 	// http://docs.couchbase.com/admin/admin/REST/rest-views-get.html
 	ddocName := h.PathVar("ddoc")
+	viewName := h.PathVar("view")
 	if ddocName == "" {
 		ddocName = db.DesignDocSyncGateway
 	}
-	viewName := h.PathVar("view")
 	opts := db.Body{}
 
 	// Boolean options:

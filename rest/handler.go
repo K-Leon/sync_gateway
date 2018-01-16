@@ -76,6 +76,7 @@ type handler struct {
 	serialNumber   uint64
 	loggedDuration bool
 	runOffline     bool
+	queryValues    url.Values // Copy of results of rq.URL.Query()
 }
 
 type handlerPrivs int
@@ -149,7 +150,7 @@ func (h *handler) invoke(method handlerMethod) error {
 		return base.HTTPErrorf(http.StatusUnsupportedMediaType, "Unsupported Content-Encoding; use gzip")
 	}
 
-	h.setHeader("Server", VersionString)
+	h.setHeader("Server", base.VersionString)
 
 	// If there is a "db" path variable, look up the database context:
 	var dbContext *db.DatabaseContext
@@ -311,14 +312,12 @@ func (h *handler) checkAuth(context *db.DatabaseContext) error {
 		* and the username and password match those in the oidc default provider config
 		* then authorize this request
 		 */
-		if unsupportedOptions := context.Options.UnsupportedOptions; unsupportedOptions != nil {
-			if unsupportedOptions.OidcTestProvider.Enabled && strings.HasSuffix(h.rq.URL.Path, "/_oidc_testing/token") {
-				if username, password := h.getBasicAuth(); username != "" && password != "" {
-					provider := context.Options.OIDCOptions.Providers.GetProviderForIssuer(issuerUrlForDB(h, context.Name), testProviderAudiences)
-					if provider != nil && provider.ClientID != nil && provider.ValidationKey != nil {
-						if *provider.ClientID == username && *provider.ValidationKey == password {
-							return nil
-						}
+		if context.Options.UnsupportedOptions.OidcTestProvider.Enabled && strings.HasSuffix(h.rq.URL.Path, "/_oidc_testing/token") {
+			if username, password := h.getBasicAuth(); username != "" && password != "" {
+				provider := context.Options.OIDCOptions.Providers.GetProviderForIssuer(issuerUrlForDB(h, context.Name), testProviderAudiences)
+				if provider != nil && provider.ClientID != nil && provider.ValidationKey != nil {
+					if *provider.ClientID == username && *provider.ValidationKey == password {
+						return nil
 					}
 				}
 			}
@@ -378,8 +377,15 @@ func (h *handler) SetPathVar(name string, value string) {
 	mux.Vars(h.rq)[name] = url.QueryEscape(value)
 }
 
+func (h *handler) getQueryValues() url.Values {
+	if h.queryValues == nil {
+		h.queryValues = h.rq.URL.Query()
+	}
+	return h.queryValues
+}
+
 func (h *handler) getQuery(query string) string {
-	return h.rq.URL.Query().Get(query)
+	return h.getQueryValues().Get(query)
 }
 
 func (h *handler) getJSONStringQuery(query string) string {
@@ -407,7 +413,7 @@ func (h *handler) getOptBoolQuery(query string, defaultValue bool) bool {
 
 // Returns the integer value of a URL query, defaulting to 0 if unparseable
 func (h *handler) getIntQuery(query string, defaultValue uint64) (value uint64) {
-	return getRestrictedIntQuery(h.rq.URL.Query(), query, defaultValue, 0, 0, false)
+	return getRestrictedIntQuery(h.getQueryValues(), query, defaultValue, 0, 0, false)
 }
 
 func (h *handler) getJSONQuery(query string) (value interface{}, err error) {
@@ -579,6 +585,27 @@ func (h *handler) writeJSONStatus(status int, value interface{}) {
 
 func (h *handler) writeJSON(value interface{}) {
 	h.writeJSONStatus(http.StatusOK, value)
+}
+
+func (h *handler) writeText(value []byte) {
+	h.writeTextStatus(http.StatusOK, value)
+}
+
+func (h *handler) writeTextStatus(status int, value []byte) {
+	if !h.requestAccepts("text/plain") {
+		base.Warn("Client won't accept text/plain, only %s", h.rq.Header.Get("Accept"))
+		h.writeStatus(http.StatusNotAcceptable, "only text/plain available")
+		return
+	}
+
+	h.setHeader("Content-Type", "text/plain charset=utf-8")
+	h.setHeader("Content-Length", fmt.Sprintf("%d", len(value)))
+	if status > 0 {
+		h.response.WriteHeader(status)
+		h.setStatus(status, "")
+	}
+	h.response.Write(value)
+
 }
 
 func (h *handler) addJSON(value interface{}) {

@@ -11,7 +11,6 @@ package rest
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	httpprof "net/http/pprof"
@@ -19,7 +18,6 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
-	"strings"
 
 	"sync/atomic"
 
@@ -28,50 +26,12 @@ import (
 	"github.com/couchbase/sync_gateway/db"
 )
 
-const ServerName = "@PRODUCT_NAME@"                   // DO NOT CHANGE; clients check this
-const VersionNumber float64 = 1.4                    // API/feature level
-const VersionBuildNumberString = "@PRODUCT_VERSION@" // Real string substituted by Gerrit
-const VersionCommitSHA = "@COMMIT_SHA@"              // Real string substituted by Gerrit
-
-// This appears in the "Server:" header of HTTP responses.
-// This should be changed only very cautiously, because Couchbase Lite parses the header value
-// to determine whether it's talking to Sync Gateway (vs. CouchDB) and what version. This in turn
-// determines what replication API features it will use.
-var VersionString string
-
-// This includes build number; appears in the response of "GET /" and the initial log message
-var LongVersionString string
-
-// Either comes from Gerrit (jenkins builds) or Git (dev builds)
-var ProductName string
-
-func init() {
-	if VersionBuildNumberString[0] != '@' {
-		//Split version number and build number (optional)
-		versionTokens := strings.Split(VersionBuildNumberString, "-")
-		BuildVersionString := versionTokens[0]
-		var BuildNumberString string
-		if len(versionTokens) > 1 {
-			BuildNumberString = fmt.Sprintf("%s;", versionTokens[1])
-		}
-		LongVersionString = fmt.Sprintf("%s/%s(%s%.7s)",
-			ServerName, BuildVersionString, BuildNumberString, VersionCommitSHA)
-
-		VersionString = fmt.Sprintf("%s/%s", ServerName, BuildVersionString)
-		ProductName = ServerName
-	} else {
-		LongVersionString = fmt.Sprintf("%s/%s(%.7s%s)", GitProductName, GitBranch, GitCommit, GitDirty)
-		VersionString = fmt.Sprintf("%s/%g branch/%s commit/%.7s%s", GitProductName, VersionNumber, GitBranch, GitCommit, GitDirty)
-		ProductName = GitProductName
-	}
-}
-
 // HTTP handler for the root ("/")
 func (h *handler) handleRoot() error {
 	response := map[string]interface{}{
 		"couchdb": "Welcome",
-		"version": LongVersionString,
-		"vendor":  db.Body{"name": ProductName, "version": VersionNumber},
+		"version": base.LongVersionString,
+		"vendor":  db.Body{"name": base.ProductName, "version": base.VersionNumber},
 	}
 	if h.privs == adminPrivs {
 		response["ADMIN"] = true
@@ -152,7 +112,14 @@ func (h *handler) handleGetDB() error {
 	if h.rq.Method == "HEAD" {
 		return nil
 	}
-	lastSeq, _ := h.db.LastSequence()
+
+	lastSeq := uint64(0)
+	runState := db.RunStateString[atomic.LoadUint32(&h.db.State)]
+
+	// Don't bother trying to lookup LastSequence() if offline
+	if runState != db.RunStateString[db.DBOffline] {
+		lastSeq, _ = h.db.LastSequence()
+	}
 
 	response := db.Body{
 		"db_name":              h.db.Name,
@@ -162,7 +129,7 @@ func (h *handler) handleGetDB() error {
 		"compact_running":      false, // TODO: Implement this
 		"purge_seq":            0,     // TODO: Should track this value
 		"disk_format_version":  0,     // Probably meaningless, but add for compatibility
-		"state":                db.RunStateString[atomic.LoadUint32(&h.db.State)],
+		"state":                runState,
 		//"doc_count":          h.db.DocCount(), // Removed: too expensive to compute (#278)
 	}
 	h.writeJSON(response)

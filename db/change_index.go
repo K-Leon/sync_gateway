@@ -1,6 +1,7 @@
 package db
 
 import (
+	sgbucket "github.com/couchbase/sg-bucket"
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/channels"
 )
@@ -24,7 +25,7 @@ import (
 type ChangeIndex interface {
 
 	// Initialize the index
-	Init(context *DatabaseContext, lastSequence SequenceID, onChange func(base.Set), cacheOptions *CacheOptions, indexOptions *ChangeIndexOptions) error
+	Init(context *DatabaseContext, lastSequence SequenceID, onChange func(base.Set), cacheOptions *CacheOptions, indexOptions *ChannelIndexOptions) error
 
 	// Stop the index
 	Stop()
@@ -41,7 +42,7 @@ type ChangeIndex interface {
 	GetCachedChanges(channelName string, options ChangesOptions) (validFrom uint64, entries []*LogEntry)
 
 	// Called to add a document to the index
-	DocChanged(docID string, docJSON []byte, seq uint64, vbucket uint16)
+	DocChanged(event sgbucket.FeedEvent)
 
 	// Retrieves stable sequence for index
 	GetStableSequence(docID string) SequenceID
@@ -71,14 +72,15 @@ const (
 	MemoryCache
 )
 
-type ChangeIndexOptions struct {
-	Type          IndexType       // Index type
-	Spec          base.BucketSpec // Indexing bucket spec
-	Bucket        base.Bucket     // Indexing bucket
-	Writer        bool            // Cache Writer
-	Options       CacheOptions    // Caching options
-	NumShards     uint16          // The number of CBGT shards to use]
-	HashFrequency uint16          // Hash frequency for changes feeds
+type ChannelIndexOptions struct {
+	Type                      IndexType       // Index type
+	Spec                      base.BucketSpec // Indexing bucket spec
+	Bucket                    base.Bucket     // Indexing bucket
+	Writer                    bool            // Cache Writer
+	Options                   CacheOptions    // Caching options
+	NumShards                 uint16          // The number of CBGT shards
+	HashFrequency             uint16          // Hash frequency for changes feeds (in changes entries)
+	TombstoneCompactFrequency *int            // Tombstone Compaction frequency (in hours)
 }
 
 type SequenceHashOptions struct {
@@ -102,11 +104,20 @@ func (entry *LogEntry) IsRemoved() bool {
 	return entry.Flags&channels.Removed != 0
 }
 
+func (entry *LogEntry) IsDeleted() bool {
+	return entry.Flags&channels.Deleted != 0
+}
+
+// Returns false if the entry is either a removal or a delete
+func (entry *LogEntry) IsActive() bool {
+	return !entry.IsRemoved() && !entry.IsDeleted()
+}
+
 func (entry *LogEntry) SetRemoved() {
 	entry.Flags |= channels.Removed
 }
 
-func (c ChangeIndexOptions) ValidateOrPanic() {
+func (c ChannelIndexOptions) ValidateOrPanic() {
 	if c.NumShards == 0 {
 		base.LogPanic("The number of shards must be greater than 0")
 	}

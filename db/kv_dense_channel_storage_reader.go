@@ -11,9 +11,10 @@ package db
 
 import (
 	"errors"
-	"sync"
-
+	"fmt"
 	"github.com/couchbase/sync_gateway/base"
+	"github.com/couchbase/sync_gateway/channels"
+	"sync"
 )
 
 // Implementation of ChannelStorage that stores entries as an append-based list of
@@ -76,18 +77,19 @@ func (ds *DenseStorageReader) UpdateCache(sinceClock base.SequenceClock, toClock
 // caller.  Changes are retrieved in vbucket order, to allow a limit check after each vbucket (to avoid retrieval).  Since
 // a given partition includes results for more than one vbucket
 
-func (ds *DenseStorageReader) GetChanges(sinceClock base.SequenceClock, toClock base.SequenceClock, limit int) (changes []*LogEntry, err error) {
+func (ds *DenseStorageReader) GetChanges(sinceClock base.SequenceClock, toClock base.SequenceClock, limit int, activeOnly bool) (changes []*LogEntry, err error) {
 
 	changes = make([]*LogEntry, 0)
 
 	// Identify what's changed:
 	//  changedVbuckets: ordered list of vbuckets that have changes, based on the clock comparison
 	//  partitionRanges: array of PartitionRange, indexed by partitionNo
-
 	changedVbuckets, partitionRanges := ds.calculateChanged(sinceClock, toClock)
 
 	// changed partitions is a cache of changes for a partition, for reuse by multiple vbs
 	changedPartitions := make(map[uint16]*PartitionChanges, len(partitionRanges))
+
+	var activecount int
 
 	for _, vbNo := range changedVbuckets {
 		partitionNo := ds.partitions.PartitionForVb(vbNo)
@@ -99,7 +101,22 @@ func (ds *DenseStorageReader) GetChanges(sinceClock base.SequenceClock, toClock 
 			}
 			changedPartitions[partitionNo] = partitionChanges
 		}
-		changes = append(changes, partitionChanges.GetVbChanges(vbNo)...)
+		vbChanges := partitionChanges.GetVbChanges(vbNo)
+		changes = append(changes, vbChanges...)
+
+		if activeOnly {
+			// re-iterate over vbChanges to count the number of active
+			// use that count to determine whether we're at the limit
+			for _, logEntry := range vbChanges {
+				if !logEntry.IsRemoved() && logEntry.Flags&channels.Deleted == 0 {
+					activecount++
+				}
+			}
+			if limit > 0 && activecount > limit {
+				break
+			}
+		}
+
 		if limit > 0 && len(changes) > limit {
 			break
 		}
@@ -311,6 +328,10 @@ func NewDensePartitionStorageReader(channelName string, partitionNo uint16, inde
 	return storage
 }
 
+func (d DensePartitionStorageReader) String() string {
+	return fmt.Sprintf("partition: %d channel: %s", d.partitionNo, d.channelName)
+}
+
 // GetChanges attempts to return results from the cached changes.  If the cache doesn't satisfy the specified range,
 // retrieves from the index.  Note: currently no writeback of indexed retrieval into the cache - cache is only updated
 // during UpdateCache()
@@ -516,9 +537,11 @@ func (pr *DensePartitionStorageReader) getIndexedChanges(partitionRange base.Par
 	if err != nil {
 		return nil, err
 	}
+
 	changes = NewPartitionChanges()
 	keySet := make(map[string]bool, 0)
 	for i := len(blockList.blocks) - 1; i >= 0; i-- {
+
 		blockListEntry := blockList.blocks[i]
 		blockKey := blockListEntry.Key(blockList)
 
@@ -552,6 +575,7 @@ func (pr *DensePartitionStorageReader) getIndexedChanges(partitionRange base.Par
 				// Expected when processing the oldest block in the range.  Don't include in set
 			}
 		}
+
 		// Prepend partition changes with the results for this block
 		changes.PrependChanges(blockChanges)
 

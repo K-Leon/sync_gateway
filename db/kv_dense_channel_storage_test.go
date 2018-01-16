@@ -42,8 +42,9 @@ func assertLogEntriesEqual(t *testing.T, actualEntry *LogEntry, expectedEntry *L
 // -----------------
 func TestDenseBlockSingleDoc(t *testing.T) {
 
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	block := NewDenseBlock("block1", nil)
 
@@ -90,10 +91,19 @@ func TestDenseBlockSingleDoc(t *testing.T) {
 }
 
 func TestDenseBlockMultipleInserts(t *testing.T) {
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
 
-	block := NewDenseBlock("block1", nil)
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
+
+	block := DenseBlock{}
+	block.Key = "block1"
+
+	// Make sure we can safely call getEntryCount() on uninitialized DenseBlock
+	assert.Equals(t, block.getEntryCount(), uint16(0))
+
+	// Initialize the block value 
+	block.value = make([]byte, DB_HEADER_LEN, 400)
 
 	// Inserts
 	entries := make([]*LogEntry, 10)
@@ -115,11 +125,67 @@ func TestDenseBlockMultipleInserts(t *testing.T) {
 
 }
 
+func TestDenseBlockGetIndexEntry(t *testing.T) {
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
+
+	block := NewDenseBlock("block1", nil)
+
+	// Inserts
+	entries := make([]*LogEntry, 10)
+	for i := 0; i < 10; i++ {
+		entries[i] = makeBlockEntry(fmt.Sprintf("doc%d", i), "1-abc", i*10, i+1, IsNotRemoval, IsAdded)
+	}
+	overflow, pendingRemoval, _, _, err := block.AddEntrySet(entries, indexBucket)
+	assertNoError(t, err, "Error adding entry set")
+	assert.Equals(t, len(overflow), 0)
+	assert.Equals(t, len(pendingRemoval), 0)
+	assert.Equals(t, block.getEntryCount(), uint16(10))
+
+	entry := block.GetIndexEntry(0)
+	assert.NotEquals(t, entry, nil)
+
+	entry2 := block.GetIndexEntry(1300)
+	assert.Equals(t, len(entry2), 0)
+	assert.Equals(t, cap(entry2), 0)
+}
+
+func TestDenseBlockGetEntry(t *testing.T) {
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
+
+	block := NewDenseBlock("block1", nil)
+
+	// Inserts
+	entries := make([]*LogEntry, 10)
+	for i := 0; i < 10; i++ {
+		entries[i] = makeBlockEntry(fmt.Sprintf("doc%d", i), "1-abc", i*10, i+1, IsNotRemoval, IsAdded)
+	}
+	overflow, pendingRemoval, _, _, err := block.AddEntrySet(entries, indexBucket)
+	assertNoError(t, err, "Error adding entry set")
+	assert.Equals(t, len(overflow), 0)
+	assert.Equals(t, len(pendingRemoval), 0)
+	assert.Equals(t, block.getEntryCount(), uint16(10))
+
+	entry := block.GetIndexEntry(0)
+	assert.NotEquals(t, entry, nil)
+
+	entry2 := block.GetIndexEntry(1300)
+	assert.Equals(t, len(entry2), 0)
+	assert.Equals(t, cap(entry2), 0)
+}
+
 func TestDenseBlockMultipleUpdates(t *testing.T) {
 	base.EnableLogKey("ChannelStorage")
 	base.EnableLogKey("ChannelStorage+")
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	block := NewDenseBlock("block1", nil)
 
@@ -181,8 +247,10 @@ func TestDenseBlockMultipleUpdates(t *testing.T) {
 func TestDenseBlockRemovalByKey(t *testing.T) {
 	base.EnableLogKey("ChannelStorage")
 	base.EnableLogKey("ChannelStorage+")
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	block := NewDenseBlock("block1", nil)
 
@@ -241,8 +309,10 @@ func TestDenseBlockRemovalByKey(t *testing.T) {
 func TestDenseBlockRollbackTo(t *testing.T) {
 	base.EnableLogKey("ChannelStorage")
 	base.EnableLogKey("ChannelStorage+")
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	block := NewDenseBlock("block1", nil)
 
@@ -315,12 +385,31 @@ func TestDenseBlockRollbackTo(t *testing.T) {
 	assert.Equals(t, len(foundEntries), 1)
 	assertLogEntry(t, foundEntries[0], "doc2", "1-abc", 2, 3)
 
+	// Attempt to rollback on an empty block
+	block = NewDenseBlock("block2", nil)
+
+	// Insert an empty entry list
+	entries = make([]*LogEntry, 0)
+
+	overflow, pendingRemoval, _, _, err = block.AddEntrySet(entries, indexBucket)
+	assertNoError(t, err, "Error adding empty entry set")
+	assert.Equals(t, len(overflow), 0)
+	assert.Equals(t, len(pendingRemoval), 0)
+	assert.Equals(t, block.getEntryCount(), uint16(0))
+
+	// Rollback should complete in this empty block
+	rollbackComplete, err = block.RollbackTo(1, 1, indexBucket)
+	assertNoError(t, err, "Error rolling back")
+	assert.Equals(t, rollbackComplete, true)
+	assert.Equals(t, block.getEntryCount(), uint16(0))
 }
 
 func DisableTestDenseBlockOverflow(t *testing.T) {
 	base.EnableLogKey("ChannelStorage")
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	block := NewDenseBlock("block1", nil)
 
@@ -389,8 +478,9 @@ func DisableTestDenseBlockOverflow(t *testing.T) {
 func TestDenseBlockConcurrentUpdates(t *testing.T) {
 	base.EnableLogKey("ChannelStorage")
 
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	block := NewDenseBlock("block1", nil)
 
@@ -456,8 +546,10 @@ func TestDenseBlockConcurrentUpdates(t *testing.T) {
 // ------------------------
 func TestDenseBlockIterator(t *testing.T) {
 
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
+
 	block := NewDenseBlock("block1", nil)
 
 	// Inserts
@@ -518,9 +610,11 @@ func TestDenseBlockList(t *testing.T) {
 
 	base.EnableLogKey("ChannelStorage+")
 
-	log.Printf("Calling testIndexBucket() to bucket on server: %v", kTestURL)
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+	log.Printf("Calling testIndexBucket() to bucket on server: %v", base.UnitTestUrl())
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	// Initialize a new block list.  Will initialize with first block
 	list := NewDenseBlockList("ABC", 1, indexBucket)
@@ -557,9 +651,11 @@ func TestDenseBlockListBadCas(t *testing.T) {
 
 	base.EnableLogKey("ChannelStorage+")
 
-	log.Printf("Calling testIndexBucket() to bucket on server: %v", kTestURL)
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+	log.Printf("Calling testIndexBucket() to bucket on server: %v", base.UnitTestUrl())
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	// Initialize a new block list manually to set an unexpected cas value.
 	list := &DenseBlockList{
@@ -602,8 +698,10 @@ func TestDenseBlockListBadCas(t *testing.T) {
 func TestDenseBlockListConcurrentInit(t *testing.T) {
 
 	base.EnableLogKey("ChannelStorage+")
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	// Concurrent initialization
 	var wg sync.WaitGroup
@@ -635,9 +733,11 @@ func TestDenseBlockListRotate(t *testing.T) {
 
 	base.EnableLogKey("ChannelStorage+")
 
-	log.Printf("Calling testIndexBucket() to bucket on server: %v", kTestURL)
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+	log.Printf("Calling testIndexBucket() to bucket on server: %v", base.UnitTestUrl())
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	// Initialize a new block list.  Will initialize with first block
 	list := NewDenseBlockList("ABC", 1, indexBucket)
@@ -668,8 +768,10 @@ func TestDenseBlockListRotate(t *testing.T) {
 
 func TestCalculateChangedPartitions(t *testing.T) {
 	base.EnableLogKey("ChannelStorage+")
-	indexBucket := testIndexBucket()
-	defer indexBucket.Close()
+
+	testIndexBucket := base.GetTestIndexBucketOrPanic()
+	defer testIndexBucket.Close()
+	indexBucket := testIndexBucket.Bucket
 
 	reader := NewDenseStorageReader(indexBucket, "ABC", testPartitionMap())
 

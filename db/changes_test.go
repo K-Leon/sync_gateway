@@ -17,39 +17,19 @@ import (
 
 	"github.com/couchbaselabs/go.assert"
 
+	"bytes"
+	"fmt"
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/channels"
 )
 
 // Unit test for bug #314
 func TestChangesAfterChannelAdded(t *testing.T) {
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
-	_testChangesAfterChannelAdded(t, db)
-}
 
-func printChanges(changes []*ChangeEntry) {
-	for _, change := range changes {
-		log.Printf("Change:%+v", change)
-	}
-}
-
-func getLastSeq(changes []*ChangeEntry) SequenceID {
-	if len(changes) > 0 {
-		return changes[len(changes)-1].Seq
-	}
-	return SequenceID{}
-}
-
-func getZeroSequence(db *Database) ChangesOptions {
-	if db.SequenceType == IntSequenceType {
-		return ChangesOptions{Since: SequenceID{Seq: 0}}
-	} else {
-		return ChangesOptions{Since: SequenceID{Clock: base.NewSequenceClockImpl()}}
-	}
-}
-
-func _testChangesAfterChannelAdded(t *testing.T, db *Database) {
 	base.EnableLogKey("IndexChanges")
 	base.EnableLogKey("Hash+")
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
@@ -93,9 +73,10 @@ func _testChangesAfterChannelAdded(t *testing.T, db *Database) {
 		ID:      "doc1",
 		Changes: []ChangeRev{{"rev": revid}}})
 	assert.DeepEquals(t, changes[2], &ChangeEntry{ // Seq 2, from ABC and PBS
-		Seq:     SequenceID{Seq: 2},
-		ID:      "_user/naomi",
-		Changes: []ChangeRev{}})
+		Seq:       SequenceID{Seq: 2},
+		ID:        "_user/naomi",
+		Changes:   []ChangeRev{},
+		pseudoDoc: true})
 	lastSeq := getLastSeq(changes)
 	lastSeq, _ = db.ParseSequenceID(lastSeq.String())
 
@@ -119,11 +100,40 @@ func _testChangesAfterChannelAdded(t *testing.T, db *Database) {
 	changes, err = db.GetChanges(base.SetOf("*"), getZeroSequence(db))
 	assertNoError(t, err, "Couldn't GetChanges")
 	printChanges(changes)
+
+}
+
+func printChanges(changes []*ChangeEntry) {
+	for _, change := range changes {
+		log.Printf("Change:%+v", change)
+	}
+}
+
+func getLastSeq(changes []*ChangeEntry) SequenceID {
+	if len(changes) > 0 {
+		return changes[len(changes)-1].Seq
+	}
+	return SequenceID{}
+}
+
+func getZeroSequence(db *Database) ChangesOptions {
+	if db.SequenceType == IntSequenceType {
+		return ChangesOptions{Since: SequenceID{Seq: 0}}
+	} else {
+		return ChangesOptions{Since: SequenceID{Clock: base.NewSequenceClockImpl()}}
+	}
 }
 
 func TestDocDeletionFromChannelCoalescedRemoved(t *testing.T) {
+
+	if !base.UnitTestUrlIsWalrus() && base.TestUseXattrs() {
+		t.Skip("This test is known to be failing against couchbase server with XATTRS enabled.  See https://gist.github.com/tleyden/a41632355fadde54f19e84ba68015512")
+	}
+
 	base.EnableLogKey("*")
-	db := setupTestDB(t)
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
@@ -176,7 +186,6 @@ func TestDocDeletionFromChannelCoalescedRemoved(t *testing.T) {
 	history["parents"] = []int{-1, 0, 1}
 	history["channels"] = []base.Set{base.SetOf("A", "B"), base.SetOf("B"), base.SetOf("B")}
 
-
 	//Marshall back to JSON
 	b, err := json.Marshal(x)
 
@@ -192,17 +201,23 @@ func TestDocDeletionFromChannelCoalescedRemoved(t *testing.T) {
 
 	assert.Equals(t, len(changes), 1)
 	assert.DeepEquals(t, changes[0], &ChangeEntry{
-		Seq:     SequenceID{Seq: 2},
-		ID:      "alpha",
-		Removed: base.SetOf("A"),
+		Seq:        SequenceID{Seq: 2},
+		ID:         "alpha",
+		Removed:    base.SetOf("A"),
 		allRemoved: true,
-		Changes: []ChangeRev{{"rev": "2-e99405a23fa102238fa8c3fd499b15bc"}}})
+		Changes:    []ChangeRev{{"rev": "2-e99405a23fa102238fa8c3fd499b15bc"}}})
 
 	printChanges(changes)
 }
 
 func TestDocDeletionFromChannelCoalesced(t *testing.T) {
-	db := setupTestDB(t)
+
+	if !base.UnitTestUrlIsWalrus() && base.TestUseXattrs() {
+		t.Skip("This test is known to be failing against couchbase server with XATTRS enabled.  Same error as TestDocDeletionFromChannelCoalescedRemoved")
+	}
+
+	db, testBucket := setupTestDBWithCacheOptions(t, CacheOptions{})
+	defer testBucket.Close()
 	defer tearDownTestDB(t, db)
 
 	db.ChannelMapper = channels.NewDefaultChannelMapper()
@@ -274,4 +289,87 @@ func TestDocDeletionFromChannelCoalesced(t *testing.T) {
 		Changes: []ChangeRev{{"rev": "3-e99405a23fa102238fa8c3fd499b15bc"}}})
 
 	printChanges(changes)
+}
+
+// Benchmark to validate fix for https://github.com/couchbase/sync_gateway/issues/2428
+func BenchmarkChangesFeedDocUnmarshalling(b *testing.B) {
+
+	db, testBucket := setupTestDBWithCacheOptions(b, CacheOptions{})
+	defer testBucket.Close()
+	defer tearDownTestDB(b, db)
+
+	fieldVal := func(valSizeBytes int) string {
+		buffer := bytes.Buffer{}
+		for i := 0; i < valSizeBytes; i++ {
+			buffer.WriteString("a")
+		}
+		return buffer.String()
+	}
+
+	createDoc := func(numKeys, valSizeBytes int) Body {
+		doc := Body{}
+		for keyNum := 0; keyNum < numKeys; keyNum++ {
+			doc[fmt.Sprintf("%v", keyNum)] = fieldVal(valSizeBytes)
+		}
+		return doc
+	}
+
+	numDocs := 400
+	numKeys := 200
+	valSizeBytes := 1024
+
+	// Create 2k docs of size 50k, 1000 keys with branches, 1 parent + 2 child branches -- doesn't matter which API .. bucket api
+	for docNum := 0; docNum < numDocs; docNum++ {
+
+		// Create the parent rev
+		docid := base.CreateUUID()
+		docBody := createDoc(numKeys, valSizeBytes)
+		revId, err := db.Put(docid, docBody)
+		if err != nil {
+			b.Fatalf("Error creating doc: %v", err)
+		}
+
+		// Create child rev 1
+		docBody["child"] = "A"
+		err = db.PutExistingRev(docid, docBody, []string{"2-A", revId})
+		if err != nil {
+			b.Fatalf("Error creating child1 rev: %v", err)
+		}
+
+		// Create child rev 2
+		docBody["child"] = "B"
+		err = db.PutExistingRev(docid, docBody, []string{"2-B", revId})
+		if err != nil {
+			b.Fatalf("Error creating child2 rev: %v", err)
+		}
+
+	}
+
+	// Start changes feed
+	var options ChangesOptions
+	options.Conflicts = true  // style=all_docs
+	options.ActiveOnly = true // active_only=true
+	options.Since = SequenceID{Seq: 0}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+
+		// Changes params: POST /pm/_changes?feed=normal&heartbeat=30000&style=all_docs&active_only=true
+		// Changes request of all docs (could also do GetDoc call, but misses other possible things). One shot, .. etc
+
+		options.Terminator = make(chan bool)
+		feed, err := db.MultiChangesFeed(base.SetOf("*"), options)
+		if err != nil {
+			b.Fatalf("Error getting changes feed: %v", err)
+		}
+		for changeEntry := range feed {
+			//log.Printf("changeEntry: %v", changeEntry)
+			if changeEntry == nil {
+				break
+			}
+		}
+		close(options.Terminator)
+
+	}
+
 }

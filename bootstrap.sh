@@ -120,6 +120,12 @@ downloadHelperScripts () {
 	chmod +x test.sh
     fi
 
+    if [ ! -f test_with_coverage.sh ]; then
+	echo "Downloading test_with_coverage.sh"
+	curl -s "https://raw.githubusercontent.com/couchbase/sync_gateway/$COMMIT/test_with_coverage.sh" > test_with_coverage.sh
+	chmod +x test_with_coverage.sh
+    fi
+
     if [ ! -f bench.sh ]; then
 	echo "Downloading bench.sh"
 	curl -s "https://raw.githubusercontent.com/couchbase/sync_gateway/$COMMIT/bench.sh" > bench.sh

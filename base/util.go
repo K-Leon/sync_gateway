@@ -12,20 +12,26 @@ package base
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"expvar"
 	"fmt"
 	"io"
-	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/couchbase/go-couchbase"
+	"github.com/couchbase/gomemcached"
+	"github.com/couchbaselabs/gocbconnstr"
+	pkgerrors "github.com/pkg/errors"
 )
 
 const (
@@ -144,7 +150,7 @@ func CouchbaseUrlWithAuth(serverUrl, username, password, bucketname string) (str
 	// parse url and reconstruct it piece by piece
 	u, err := url.Parse(serverUrl)
 	if err != nil {
-		return "", err
+		return "", pkgerrors.Wrapf(err, "Error parsing serverUrl: %v", serverUrl)
 	}
 
 	userPass := bytes.Buffer{}
@@ -205,12 +211,6 @@ func TransformBucketCredentials(inputUsername, inputPassword, inputBucketname st
 		password = ""
 	}
 
-	// If it's the default bucket, then set the username to "default"
-	// workaround for https://github.com/couchbaselabs/cbgt/issues/32#issuecomment-136481228
-	if inputBucketname == "" || inputBucketname == "default" {
-		username = "default"
-	}
-
 	return username, password, inputBucketname
 
 }
@@ -231,17 +231,17 @@ func IsPowerOfTwo(n uint16) bool {
 //
 //This function takes a ttl as a Duration and returns an int
 //formatted as required by CBS expiry processing
-func DurationToCbsExpiry(ttl time.Duration) int {
+func DurationToCbsExpiry(ttl time.Duration) uint32 {
 	if ttl <= kMaxDeltaTtlDuration {
-		return int(ttl.Seconds())
+		return uint32(ttl.Seconds())
 	} else {
-		return int(time.Now().Add(ttl).Unix())
+		return uint32(time.Now().Add(ttl).Unix())
 	}
 }
 
 //This function takes a ttl in seconds and returns an int
 //formatted as required by CBS expiry processing
-func SecondsToCbsExpiry(ttl int) int {
+func SecondsToCbsExpiry(ttl int) uint32 {
 	return DurationToCbsExpiry(time.Duration(ttl) * time.Second)
 }
 
@@ -250,9 +250,46 @@ func CbsExpiryToTime(expiry uint32) time.Time {
 	if expiry <= kMaxDeltaTtl {
 		return time.Now().Add(time.Duration(expiry) * time.Second)
 	} else {
-		log.Printf("expiry for %v becomes %v", expiry, time.Unix(int64(expiry), 0))
 		return time.Unix(int64(expiry), 0)
 	}
+}
+
+// ReflectExpiry attempts to convert expiry from one of the following formats to a Couchbase Server expiry value:
+//   1. Numeric JSON values are converted to uint32 and returned as-is
+//   2. String JSON values that are numbers are converted to int32 and returned as-is
+//   3. String JSON values that are ISO-8601 dates are converted to UNIX time and returned
+//   4. Null JSON values return 0
+func ReflectExpiry(rawExpiry interface{}) (*uint32, error) {
+	switch expiry := rawExpiry.(type) {
+	case float64:
+		return ValidateUint32Expiry(int64(expiry))
+	case string:
+		// First check if it's a numeric string
+		expInt, err := strconv.ParseInt(expiry, 10, 32)
+		if err == nil {
+			return ValidateUint32Expiry(expInt)
+		}
+		// Check if it's an ISO-8601 date
+		expRFC3339, err := time.Parse(time.RFC3339, expiry)
+		if err == nil {
+			return ValidateUint32Expiry(expRFC3339.Unix())
+		} else {
+			return nil, pkgerrors.Wrapf(err, "Unable to parse expiry %s as either numeric or date expiry", rawExpiry)
+		}
+	case nil:
+		// Leave as zero/empty expiry
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("Unrecognized expiry format")
+	}
+}
+
+func ValidateUint32Expiry(expiry int64) (*uint32, error) {
+	if expiry < 0 || expiry > math.MaxUint32 {
+		return nil, fmt.Errorf("Expiry value is not within valid range: %d", expiry)
+	}
+	uint32Expiry := uint32(expiry)
+	return &uint32Expiry, nil
 }
 
 // Needed due to https://github.com/couchbase/sync_gateway/issues/1345
@@ -280,6 +317,8 @@ type RetrySleeper func(retryCount int) (shouldContinue bool, timeTosleepMs int)
 // If the worker has exceeded it's retry attempts, then it will not be called again
 // even if it returns shouldRetry = true.
 type RetryWorker func() (shouldRetry bool, err error, value interface{})
+
+type TimeoutWorker func()
 
 func RetryLoop(description string, worker RetryWorker, sleeper RetrySleeper) (error, interface{}) {
 
@@ -310,6 +349,83 @@ func RetryLoop(description string, worker RetryWorker, sleeper RetrySleeper) (er
 	}
 }
 
+type WorkerResult struct {
+	ShouldRetry bool
+	Error       error
+	Value       interface{}
+}
+
+func (w WorkerResult) Unwrap() (ShouldRetry bool, Error error, Value interface{}) {
+	return w.ShouldRetry, w.Error, w.Value
+}
+
+func WrapRetryWorkerTimeout(worker RetryWorker) (timeoutWorker TimeoutWorker, resultChan chan WorkerResult) {
+
+	resultChan = make(chan WorkerResult)
+
+	timeoutWorker = func() {
+
+		shouldRetry, err, value := worker()
+
+		result := WorkerResult{
+			ShouldRetry: shouldRetry,
+			Error:       err,
+			Value:       value,
+		}
+		resultChan <- result
+
+	}
+
+	return timeoutWorker, resultChan
+
+}
+
+func RetryLoopTimeout(description string, worker RetryWorker, sleeper RetrySleeper, timeoutPerInvocation time.Duration) (error, interface{}) {
+
+	numAttempts := 1
+
+	for {
+
+		// Wrap the retry worker into a "timeout worker" function that can be run async and will write it's
+		// result to a channel
+		timeoutWorker, chWorkerResult := WrapRetryWorkerTimeout(worker)
+
+		// Kick off the timeout worker in it's own goroutine
+		go timeoutWorker()
+
+		// Wait for either the timeout worker to send it's result on the channel, or for the timeout to expire
+		select {
+
+		case workerResult := <-chWorkerResult:
+			shouldRetry, err, value := workerResult.Unwrap()
+
+			if !shouldRetry {
+				if err != nil {
+					return err, nil
+				}
+				return nil, value
+			}
+			shouldContinue, sleepMs := sleeper(numAttempts)
+			if !shouldContinue {
+				if err == nil {
+					err = fmt.Errorf("RetryLoop for %v giving up after %v attempts", description, numAttempts)
+				}
+				Warn("RetryLoop for %v giving up after %v attempts", description, numAttempts)
+				return err, value
+			}
+			LogTo("Debug", "RetryLoop retrying %v after %v ms.", description, sleepMs)
+
+			<-time.After(time.Millisecond * time.Duration(sleepMs))
+
+			numAttempts += 1
+
+		case <-time.After(timeoutPerInvocation):
+			return fmt.Errorf("Invocation timeout after waiting %v for worker to complete", timeoutPerInvocation), nil
+		}
+
+	}
+}
+
 // Create a RetrySleeper that will double the retry time on every iteration and
 // use the given parameters
 func CreateDoublingSleeperFunc(maxNumAttempts, initialTimeToSleepMs int) RetrySleeper {
@@ -322,6 +438,19 @@ func CreateDoublingSleeperFunc(maxNumAttempts, initialTimeToSleepMs int) RetrySl
 		}
 		if numAttempts > 1 {
 			timeToSleepMs *= 2
+		}
+		return true, timeToSleepMs
+	}
+	return sleeper
+
+}
+
+// Create a sleeper function that sleeps up to maxNumAttempts, sleeping timeToSleepMs each attempt
+func CreateSleeperFunc(maxNumAttempts, timeToSleepMs int) RetrySleeper {
+
+	sleeper := func(numAttempts int) (bool, int) {
+		if numAttempts > maxNumAttempts {
+			return false, -1
 		}
 		return true, timeToSleepMs
 	}
@@ -347,7 +476,7 @@ func WriteHistogram(expvarMap *expvar.Map, since time.Time, prefix string) {
 
 func WriteHistogramForDuration(expvarMap *expvar.Map, duration time.Duration, prefix string) {
 
-	if LogEnabled("PerfStats") {
+	if LogEnabledExcludingLogStar("PerfStats") {
 		var durationMs int
 		if duration < 1*time.Second {
 			durationMs = int(duration/(100*time.Millisecond)) * 100
@@ -411,7 +540,7 @@ func IsFilePathWritable(fp string) (bool, error) {
 	//Check that containing dir exists
 	_, err := os.Stat(containingDir)
 	if err != nil {
-		return false, err
+		return false, pkgerrors.Wrapf(err, "Error checking if %s is not writable", fp)
 	}
 
 	//Check that the filePath points to a file not a directory
@@ -419,8 +548,7 @@ func IsFilePathWritable(fp string) (bool, error) {
 	if err == nil || !os.IsNotExist(err) {
 		Warn("filePath exists")
 		if fi.Mode().IsDir() {
-			err = errors.New("filePath is a directory")
-			return false, err
+			return false, fmt.Errorf("IsFilePathWritable() called but %s is a directory rather than a file", fp)
 		}
 	}
 
@@ -431,7 +559,7 @@ func IsFilePathWritable(fp string) (bool, error) {
 		return true, nil
 	}
 	if os.IsPermission(err) {
-		return false, err
+		return false, pkgerrors.Wrapf(err, "Error checking if %s is not writable", fp)
 	}
 
 	return true, nil
@@ -473,20 +601,14 @@ func HighSeqNosToSequenceClock(highSeqs map[uint16]uint64) (*SequenceClockImpl, 
 }
 
 // Make sure that the index bucket and data bucket have correct sequence parity
-// https://github.com/couchbase/sync_gateway/issues/1133
+// See https://github.com/couchbase/sync_gateway/issues/1133 for more details
 func VerifyBucketSequenceParity(indexBucketStableClock SequenceClock, bucket Bucket) error {
 
-	cbBucket, ok := bucket.(CouchbaseBucket)
-	if !ok {
-		Warn(fmt.Sprintf("Bucket is a %T not a base.CouchbaseBucket, skipping verifyBucketSequenceParity()\n", bucket))
-		return nil
-	}
-
-	maxVbNo, err := cbBucket.GetMaxVbno()
+	maxVbNo, err := bucket.GetMaxVbno()
 	if err != nil {
 		return err
 	}
-	_, highSeqnos, err := cbBucket.GetStatsVbSeqno(maxVbNo, false)
+	_, highSeqnos, err := bucket.GetStatsVbSeqno(maxVbNo, false)
 	if err != nil {
 		return err
 	}
@@ -503,4 +625,157 @@ func VerifyBucketSequenceParity(indexBucketStableClock SequenceClock, bucket Buc
 	}
 
 	return nil
+
+}
+
+func GetGoCBBucketFromBaseBucket(baseBucket Bucket) (bucket CouchbaseBucketGoCB, err error) {
+	switch baseBucket := baseBucket.(type) {
+	case *CouchbaseBucketGoCB:
+		return *baseBucket, nil
+	case CouchbaseBucketGoCB:
+		return baseBucket, nil
+	default:
+		return CouchbaseBucketGoCB{}, fmt.Errorf("baseBucket %v was not a CouchbaseBucketGoCB.  Was type: %T", baseBucket, baseBucket)
+	}
+}
+
+func BooleanPointer(booleanValue bool) *bool {
+	return &booleanValue
+}
+
+// Convert a Couchbase URI (eg, couchbase://host1,host2) to a list of HTTP URLs with ports (eg, ["http://host1:8091", "http://host2:8091"])
+// Primary use case is for backwards compatibility with go-couchbase, cbdatasource, and CBGT. Supports secure URI's as well (couchbases://).
+// Related CBGT ticket: https://issues.couchbase.com/browse/MB-25522
+func CouchbaseURIToHttpURL(bucket Bucket, couchbaseUri string) (httpUrls []string, err error) {
+
+	// If we're using a gocb bucket, use the bucket to retrieve the mgmt endpoints.  Note that incoming bucket may be CouchbaseBucketGoCB or *CouchbaseBucketGoCB.
+	switch typedBucket := bucket.(type) {
+	case CouchbaseBucketGoCB:
+		if typedBucket.IoRouter() != nil {
+			mgmtEps := typedBucket.IoRouter().MgmtEps()
+			return mgmtEps, nil
+		}
+	case *CouchbaseBucketGoCB:
+		if typedBucket.IoRouter() != nil {
+			mgmtEps := typedBucket.IoRouter().MgmtEps()
+			return mgmtEps, nil
+		}
+	default:
+		// No bucket-based handling, fall back to URI parsing
+
+	}
+
+	// First try to do a simple URL parse, which will only work for http:// and https:// urls where there
+	// is a single host.  If that works, return the result
+	singleHttpUrl := SingleHostCouchbaseURIToHttpURL(couchbaseUri)
+	if len(singleHttpUrl) > 0 {
+		return []string{singleHttpUrl}, nil
+	}
+
+	// Unable to do simple URL parse, try to parse into components w/ gocbconnstr
+	connSpec, errParse := gocbconnstr.Parse(couchbaseUri)
+	if errParse != nil {
+		return httpUrls, pkgerrors.Wrapf(err, "Error parsing gocb connection string: %v", couchbaseUri)
+	}
+
+	for _, address := range connSpec.Addresses {
+
+		// Determine port to use for management API
+		port := gocbconnstr.DefaultHttpPort
+
+		translatedScheme := "http"
+		switch connSpec.Scheme {
+
+		case "couchbase":
+			fallthrough
+		case "couchbases":
+			return nil, fmt.Errorf("couchbase:// and couchbases:// URI schemes can only be used with GoCB buckets.  Bucket: %+v", bucket)
+		case "https":
+			translatedScheme = "https"
+		}
+
+		if address.Port > 0 {
+			port = address.Port
+		} else {
+			// If gocbconnstr didn't return a port, and it was detected to be an HTTPS connection,
+			// change the port to the secure port 18091
+			if translatedScheme == "https" {
+				port = 18091
+			}
+		}
+
+		httpUrl := fmt.Sprintf("%s://%s:%d", translatedScheme, address.Host, port)
+		httpUrls = append(httpUrls, httpUrl)
+
+	}
+
+	return httpUrls, nil
+
+}
+
+// Special case for couchbaseUri strings that contain a single host with http:// or https:// schemes,
+// possibly containing embedded basic auth.  Needed since gocbconnstr.Parse() will remove embedded
+// basic auth from URLS.
+func SingleHostCouchbaseURIToHttpURL(couchbaseUri string) (httpUrl string) {
+	result, parseUrlErr := couchbase.ParseURL(couchbaseUri)
+
+	// If there was an error parsing, return an empty string
+	if parseUrlErr != nil {
+		return ""
+	}
+
+	// If the host contains a "," then it parsed http://host1,host2 into a url with "host1,host2" as the host, which
+	// is not going to work.  Return an empty string
+	if strings.Contains(result.Host, ",") {
+		return ""
+	}
+
+	// The scheme was couchbase://, but this method only deals with non-couchbase schemes, so return empty slice
+	if strings.Contains(result.Scheme, "couchbase") {
+		return ""
+	}
+
+	// It made it past all checks.  Return a slice with a single string
+	return result.String()
+
+}
+
+// Slice a string to be less than or equal to desiredSze
+func StringPrefix(s string, desiredSize int) string {
+	if len(s) <= desiredSize {
+		return s
+	}
+
+	return s[:desiredSize]
+}
+
+// Retrieves a slice from a byte, but returns error (instead of panic) if range isn't contained by the slice
+func SafeSlice(data []byte, from int, to int) ([]byte, error) {
+	if from > len(data) || to > len(data) || from > to {
+		return nil, fmt.Errorf("Invalid slice [%d:%d] of []byte with len %d", from, to, len(data))
+	}
+	return data[from:to], nil
+}
+
+// Returns string representation of an expvar, given map name and key name
+func GetExpvarAsString(mapName string, name string) string {
+	mapVar := expvar.Get(mapName)
+	expvarMap, ok := mapVar.(*expvar.Map)
+	if !ok {
+		return ""
+	}
+	value := expvarMap.Get(name)
+	if value != nil {
+		return value.String()
+	} else {
+		return ""
+	}
+}
+
+// TODO: temporary workaround until https://issues.couchbase.com/browse/MB-27026 is implemented
+func ExtractExpiryFromDCPMutation(rq *gomemcached.MCRequest) (expiry uint32) {
+	if len(rq.Extras) < 24 {
+		return 0
+	}
+	return binary.BigEndian.Uint32(rq.Extras[20:24])
 }

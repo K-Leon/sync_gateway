@@ -28,6 +28,7 @@ import (
 	"github.com/couchbase/sync_gateway/base"
 	"github.com/couchbase/sync_gateway/db"
 	"github.com/couchbaselabs/sg-replicate"
+	pkgerrors "github.com/pkg/errors"
 )
 
 // The URL that stats will be reported to if deployment_id is set in the config
@@ -134,6 +135,10 @@ func (sc *ServerContext) Close() {
 	sc.lock.Lock()
 	defer sc.lock.Unlock()
 
+	if err := sc.replicator.StopReplications(); err != nil {
+		base.Warn("Error stopping replications: %+v.  This could cause a resource leak.  Please restart Sync Gateway to cleanup leaked resources.", err)
+	}
+
 	sc.stopStatsReporter()
 	for _, ctx := range sc.databases_ {
 		ctx.Close()
@@ -141,7 +146,11 @@ func (sc *ServerContext) Close() {
 			ctx.EventMgr.RaiseDBStateChangeEvent(ctx.Name, "offline", "Database context closed", *sc.config.AdminInterface)
 		}
 	}
+
 	sc.databases_ = nil
+
+
+
 }
 
 // Returns the DatabaseContext with the given name
@@ -210,7 +219,7 @@ func (sc *ServerContext) AllDatabases() map[string]*db.DatabaseContext {
 func (sc *ServerContext) numIndexWriters() (numIndexWriters, numIndexNonWriters int) {
 
 	for _, dbContext := range sc.databases_ {
-		if dbContext.BucketSpec.FeedType != base.DcpShardFeedType {
+		if strings.ToLower(dbContext.BucketSpec.FeedType) != base.DcpShardFeedType {
 			continue
 		}
 		if dbContext.Options.IndexOptions.Writer {
@@ -260,9 +269,12 @@ func (sc *ServerContext) getOrAddDatabaseFromConfig(config *DbConfig, useExistin
 // existing DatabaseContext or an error based on the useExisting flag.
 func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisting bool) (*db.DatabaseContext, error) {
 
+	var viewQueryTimeoutSecs *uint32
+
 	server := "http://localhost:8091"
 	pool := "default"
 	bucketName := config.Name
+	oldRevExpirySeconds := base.DefaultOldRevExpirySeconds
 
 	if config.Server != nil {
 		server = *config.Server
@@ -276,6 +288,19 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 	dbName := config.Name
 	if dbName == "" {
 		dbName = bucketName
+	}
+
+	if config.ViewQueryTimeoutSecs != nil {
+		viewQueryTimeoutSecs = config.ViewQueryTimeoutSecs
+	}
+
+	if config.OldRevExpirySeconds != nil && *config.OldRevExpirySeconds >= 0 {
+		oldRevExpirySeconds = *config.OldRevExpirySeconds
+	}
+
+	localDocExpirySecs := base.DefaultLocalDocExpirySecs
+	if config.LocalDocExpirySecs != nil && *config.LocalDocExpirySecs >= 0 {
+		localDocExpirySecs = *config.LocalDocExpirySecs
 	}
 
 	if sc.databases_[dbName] != nil {
@@ -306,15 +331,25 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 		return nil, fmt.Errorf("Unrecognized value for ImportDocs: %#v", config.ImportDocs)
 	}
 
+	importOptions := db.ImportOptions{}
+	if config.ImportFilter != nil {
+		importOptions.ImportFilter = db.NewImportFilterFunction(*config.ImportFilter)
+	}
+
 	feedType := strings.ToLower(config.FeedType)
+
+	couchbaseDriver := base.ChooseCouchbaseDriver(base.DataBucket)
 
 	// Connect to the bucket and add the database:
 	spec := base.BucketSpec{
-		Server:     server,
-		PoolName:   pool,
-		BucketName: bucketName,
-		FeedType:   feedType,
-		Auth:       config,
+		Server:               server,
+		PoolName:             pool,
+		BucketName:           bucketName,
+		FeedType:             feedType,
+		Auth:                 config,
+		CouchbaseDriver:      couchbaseDriver,
+		UseXattrs:            config.UseXattrs(),
+		ViewQueryTimeoutSecs: viewQueryTimeoutSecs,
 	}
 
 	// Set cache properties, if present
@@ -347,10 +382,13 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 	}
 
 	bucket, err := db.ConnectToBucket(spec, func(bucket string, err error) {
-		base.Warn("Lost TAP feed for bucket %s, with error: %v", bucket, err)
+
+		msg := fmt.Sprintf("%v dropped Mutation feed (TAP/DCP) due to error: %v, taking offline", bucket, err)
+		base.Warn(msg)
 
 		if dc := sc.databases_[dbName]; dc != nil {
-			err := dc.TakeDbOffline("Lost TAP feed")
+
+			err := dc.TakeDbOffline(msg)
 			if err == nil {
 
 				//start a retry loop to pick up tap feed again backing off double the delay each time
@@ -370,13 +408,17 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 					5,  //InitialRetrySleepTimeMS
 				)
 
-				description := fmt.Sprintf("Attempt reconnect to lost TAP Feed for : %v", dc.Name)
+				description := fmt.Sprintf("Attempt reconnect to lost Mutation (TAP/DCP) Feed for : %v", dc.Name)
 				err, _ := base.RetryLoop(description, worker, sleeper)
 
 				if err == nil {
-					base.LogTo("CRUD", "Connection to TAP feed for %v re-established, bringing DB back online", dc.Name)
+					base.LogTo("CRUD", "Connection to Mutation (TAP/DCP) feed for %v re-established, bringing DB back online", dc.Name)
+
+					// The 10 second wait was introduced because the bucket was not fully initialised
+					// after the return of the retry loop.
 					timer := time.NewTimer(time.Duration(10) * time.Second)
 					<-timer.C
+
 					sc.TakeDbOnline(dc)
 				}
 			}
@@ -388,7 +430,7 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 	}
 
 	// Channel index definition, if present
-	channelIndexOptions := &db.ChangeIndexOptions{} // TODO: this is confusing!  why is it called both a "change index" and a "channel index"?
+	channelIndexOptions := &db.ChannelIndexOptions{}
 	sequenceHashOptions := &db.SequenceHashOptions{}
 	if config.ChannelIndex != nil {
 		indexServer := "http://localhost:8091"
@@ -404,15 +446,18 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 		if config.ChannelIndex.Bucket != nil {
 			indexBucketName = *config.ChannelIndex.Bucket
 		}
+
+		// Index buckets always use DCP feed type
+		couchbaseDriverIndexBucket := base.ChooseCouchbaseDriver(base.IndexBucket)
+
 		indexSpec := base.BucketSpec{
 			Server:          indexServer,
 			PoolName:        indexPool,
 			BucketName:      indexBucketName,
-			CouchbaseDriver: base.GoCB,
+			CouchbaseDriver: couchbaseDriverIndexBucket,
 		}
-		if config.ChannelIndex.Username != "" {
-			indexSpec.Auth = config.ChannelIndex
-		}
+
+		indexSpec.Auth = config.ChannelIndex
 
 		if config.ChannelIndex.NumShards != 0 {
 			channelIndexOptions.NumShards = config.ChannelIndex.NumShards
@@ -424,6 +469,7 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 
 		channelIndexOptions.Spec = indexSpec
 		channelIndexOptions.Writer = config.ChannelIndex.IndexWriter
+		channelIndexOptions.TombstoneCompactFrequency = config.ChannelIndex.TombstoneCompactFrequency
 
 		// Hash bucket defaults to index bucket, but can be customized.
 		sequenceHashOptions.Size = 32
@@ -461,32 +507,35 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 		revCacheSize = db.KDefaultRevisionCacheCapacity
 	}
 
-	unsupportedOptions := &db.UnsupportedOptions{}
-	if config.Unsupported != nil {
-		if config.Unsupported.UserViews != nil {
-			if config.Unsupported.UserViews.Enabled != nil {
-				unsupportedOptions.EnableUserViews = *config.Unsupported.UserViews.Enabled
-			}
-		}
-		if config.Unsupported.OidcTestProvider != nil {
-			unsupportedOptions.OidcTestProvider = *config.Unsupported.OidcTestProvider
-		}
+	// Enable doc tracking if needed for autoImport or shadowing.  Only supported for non-xattr configurations
+	trackDocs := false
+	if !config.UseXattrs() {
+		trackDocs = autoImport || config.Shadow != nil
 	}
 
-	// Enable doc tracking if needed for autoImport or shadowing
-	trackDocs := autoImport || config.Shadow != nil
+	// Create a callback function that will be invoked if the database goes offline and comes
+	// back online again
+	dbOnlineCallback := func(dbContext *db.DatabaseContext) {
+		sc.TakeDbOnline(dbContext)
+	}
 
 	contextOptions := db.DatabaseContextOptions{
 		CacheOptions:          &cacheOptions,
 		IndexOptions:          channelIndexOptions,
 		SequenceHashOptions:   sequenceHashOptions,
 		RevisionCacheCapacity: revCacheSize,
+		OldRevExpirySeconds:   oldRevExpirySeconds,
+		LocalDocExpirySecs:    localDocExpirySecs,
 		AdminInterface:        sc.config.AdminInterface,
-		UnsupportedOptions:    unsupportedOptions,
+		UnsupportedOptions:    config.Unsupported,
 		TrackDocs:             trackDocs,
 		OIDCOptions:           config.OIDCConfig,
+		DBOnlineCallback:      dbOnlineCallback,
+		ImportOptions:         importOptions,
+		EnableXattr:           config.UseXattrs(),
 	}
 
+	// Create the DB Context
 	dbcontext, err := db.NewDatabaseContext(dbName, bucket, autoImport, contextOptions)
 	if err != nil {
 		return nil, err
@@ -501,15 +550,29 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 		return nil, err
 	}
 
-	if importDocs {
-		db, _ := db.GetDatabase(dbcontext, nil)
+	// Support for legacy importDocs handling - if xattrs aren't enabled, support a backfill-style import on startup
+	if importDocs && !config.UseXattrs() {
+		db, _ := db.GetDatabase(dbcontext, nil) // TODO: shouldn't this be checking the returned err?
 		if _, err := db.UpdateAllDocChannels(false, true); err != nil {
 			return nil, err
 		}
 	}
 
-	if config.RevsLimit != nil && *config.RevsLimit > 0 {
+	if config.RevsLimit != nil {
 		dbcontext.RevsLimit = *config.RevsLimit
+		if dbcontext.AllowConflicts() {
+			if dbcontext.RevsLimit < 20 {
+				return nil, fmt.Errorf("The revs_limit (%v) value in your Sync Gateway configuration cannot be set lower than 20.", dbcontext.RevsLimit)
+			}
+
+			if dbcontext.RevsLimit < 100 {
+				base.Warn("Setting the revs_limit (%v) to less than 100 may have unwanted results when documents are frequently updated. Please see documentation for details.", dbcontext.RevsLimit)
+			}
+		} else {
+			if dbcontext.RevsLimit <= 0 {
+				return nil, fmt.Errorf("The revs_limit (%v) value in your Sync Gateway configuration must be greater than zero.", dbcontext.RevsLimit)
+			}
+		}
 	}
 
 	dbcontext.AllowEmptyPassword = config.AllowEmptyPassword
@@ -520,12 +583,13 @@ func (sc *ServerContext) _getOrAddDatabaseFromConfig(config *DbConfig, useExisti
 
 	// Create default users & roles:
 	if err := sc.installPrincipals(dbcontext, config.Roles, "role"); err != nil {
-		return nil, err
+		return nil, pkgerrors.Wrapf(err, "Error installing principals for role")
 	} else if err := sc.installPrincipals(dbcontext, config.Users, "user"); err != nil {
-		return nil, err
+		return nil, pkgerrors.Wrapf(err, "Error installing principals for user")
 	}
 
-	emitAccessRelatedWarnings(config, dbcontext)
+	// Note: disabling access-related warnings, because they potentially block startup during view reindexing trying to query the principals view, which outweighs the usability benefit
+	//emitAccessRelatedWarnings(config, dbcontext)
 
 	// Install bucket-shadower if any:
 	if shadow := config.Shadow; shadow != nil {
@@ -614,10 +678,10 @@ func (sc *ServerContext) initEventHandlers(dbcontext *db.DatabaseContext, config
 
 		eventHandlersJSON, err := json.Marshal(eventHandlersMap)
 		if err != nil {
-			return err
+			return pkgerrors.Wrapf(err, "Error calling json.Marshal() in initEventHandlers")
 		}
 		if err := json.Unmarshal(eventHandlersJSON, eventHandlers); err != nil {
-			return err
+			return pkgerrors.Wrapf(err, "Error calling json.Unmarshal() in initEventHandlers")
 		}
 
 		// Process document commit event handlers
@@ -693,11 +757,14 @@ func (sc *ServerContext) startShadowing(dbcontext *db.DatabaseContext, shadow *S
 		}
 	}
 
+	shadowBucketCouchbaseDriver := base.ChooseCouchbaseDriver(base.DataBucket)
+
 	spec := base.BucketSpec{
-		Server:     *shadow.Server,
-		PoolName:   "default",
-		BucketName: *shadow.Bucket,
-		FeedType:   shadow.FeedType,
+		Server:          *shadow.Server,
+		PoolName:        "default",
+		BucketName:      *shadow.Bucket,
+		CouchbaseDriver: shadowBucketCouchbaseDriver,
+		FeedType:        shadow.FeedType,
 	}
 	if shadow.Pool != nil {
 		spec.PoolName = *shadow.Pool
@@ -760,7 +827,7 @@ func (sc *ServerContext) installPrincipals(context *db.DatabaseContext, spec map
 		if err != nil {
 			// A conflict error just means updatePrincipal didn't overwrite an existing user.
 			if status, _ := base.ErrorAsHTTPStatus(err); status != http.StatusConflict {
-				return fmt.Errorf("Couldn't create %s %q: %v", what, name, err)
+				return err
 			}
 		} else if isGuest {
 			base.Log("    Reset guest user to config")
@@ -907,17 +974,15 @@ func collectAccessRelatedWarnings(config *DbConfig, context *db.DatabaseContext)
 	}
 
 	numUsersInDb := 0
-
 	// If no users defined in config, and no users were returned from the view, add warning.
 	// NOTE: currently ignoring the fact that the config could contain only disabled=true users.
 	if len(config.Users) == 0 {
 
 		// There are no users in the config, but there might be users in the db.  Find out
 		// by querying the "view principals" view which will return users and roles.  We only want to
-		// find out if there is at least one user (or role) defined, so set limit == 1 to minimize
+		// find out if there is at least one user (or role) defined, so set stale=ok and limit == 1 to minimize
 		// performance hit of query.
 		viewOptions := db.Body{
-			"stale": false,
 			"limit": 1,
 		}
 		vres, err := currentDb.Bucket.View(db.DesignDocSyncGateway, db.ViewPrincipals, viewOptions)

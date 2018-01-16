@@ -29,7 +29,7 @@ import (
 )
 
 type indexTester struct {
-	restTester
+	RestTester
 	_indexBucket base.Bucket
 }
 
@@ -44,16 +44,18 @@ func initRestTester(sequenceType db.SequenceType, syncFn string) indexTester {
 func initIndexTester(useBucketIndex bool, syncFn string) indexTester {
 
 	it := indexTester{}
-	it.syncFn = syncFn
+	it.SyncFn = syncFn
 
-	it._sc = NewServerContext(&ServerConfig{
+	it.RestTesterServerContext = NewServerContext(&ServerConfig{
 		Facebook: &FacebookConfig{},
 	})
 
 	var syncFnPtr *string
-	if len(it.syncFn) > 0 {
-		syncFnPtr = &it.syncFn
+	if len(it.SyncFn) > 0 {
+		syncFnPtr = &it.SyncFn
 	}
+
+	// TODO: this should be able to use either a Walrus or a Couchbase bucket
 
 	serverName := "walrus:"
 	//serverName := "http://localhost:8091"
@@ -84,7 +86,7 @@ func initIndexTester(useBucketIndex bool, syncFn string) indexTester {
 		dbConfig.ChannelIndex = channelIndexConfig
 	}
 
-	dbContext, err := it._sc.AddDatabaseFromConfig(dbConfig)
+	dbContext, err := it.RestTesterServerContext.AddDatabaseFromConfig(dbConfig)
 
 	if useBucketIndex {
 		_, err := base.SeedTestPartitionMap(dbContext.GetIndexBucket(), 64)
@@ -97,21 +99,21 @@ func initIndexTester(useBucketIndex bool, syncFn string) indexTester {
 		panic(fmt.Sprintf("Error from AddDatabaseFromConfig: %v", err))
 	}
 
-	it._bucket = it._sc.Database("db").Bucket
+	it.RestTesterBucket = it.RestTesterServerContext.Database("db").Bucket
 
 	if useBucketIndex {
-		it._indexBucket = it._sc.Database("db").GetIndexBucket()
+		it._indexBucket = it.RestTesterServerContext.Database("db").GetIndexBucket()
 	}
 
 	return it
 }
 
 func (it *indexTester) Close() {
-	it._sc.Close()
+	it.RestTesterServerContext.Close()
 }
 
 func (it *indexTester) ServerContext() *ServerContext {
-	return it._sc
+	return it.RestTesterServerContext
 }
 
 func TestDocDeletionFromChannel(t *testing.T) {
@@ -119,7 +121,9 @@ func TestDocDeletionFromChannel(t *testing.T) {
 	// base.LogKeys["Changes"] = true
 	// base.LogKeys["Cache"] = true
 
-	rt := restTester{syncFn: `function(doc) {channel(doc.channel)}`}
+	rt := RestTester{SyncFn: `function(doc) {channel(doc.channel)}`}
+	defer rt.Close()
+
 	a := rt.ServerContext().Database("db").Authenticator()
 
 	// Create user:
@@ -127,14 +131,14 @@ func TestDocDeletionFromChannel(t *testing.T) {
 	a.Save(alice)
 
 	// Create a doc Alice can see:
-	response := rt.send(request("PUT", "/db/alpha", `{"channel":"zero"}`))
+	response := rt.Send(request("PUT", "/db/alpha", `{"channel":"zero"}`))
 
 	// Check the _changes feed:
 	rt.ServerContext().Database("db").WaitForPendingChanges()
 	var changes struct {
 		Results []db.ChangeEntry
 	}
-	response = rt.send(requestByUser("GET", "/db/_changes", "", "alice"))
+	response = rt.Send(requestByUser("GET", "/db/_changes", "", "alice"))
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, len(changes.Results), 1)
@@ -145,11 +149,11 @@ func TestDocDeletionFromChannel(t *testing.T) {
 	rev1 := changes.Results[0].Changes[0]["rev"]
 
 	// Delete the document:
-	assertStatus(t, rt.send(request("DELETE", "/db/alpha?rev="+rev1, "")), 200)
+	assertStatus(t, rt.Send(request("DELETE", "/db/alpha?rev="+rev1, "")), 200)
 
 	// Get the updates from the _changes feed:
-	rt.waitForPendingChanges()
-	response = rt.send(requestByUser("GET", fmt.Sprintf("/db/_changes?since=%s", since),
+	rt.WaitForPendingChanges()
+	response = rt.Send(requestByUser("GET", fmt.Sprintf("/db/_changes?since=%s", since),
 		"", "alice"))
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	changes.Results = nil
@@ -162,7 +166,7 @@ func TestDocDeletionFromChannel(t *testing.T) {
 	rev2 := changes.Results[0].Changes[0]["rev"]
 
 	// Now get the deleted revision:
-	response = rt.send(requestByUser("GET", "/db/alpha?rev="+rev2, "", "alice"))
+	response = rt.Send(requestByUser("GET", "/db/alpha?rev="+rev2, "", "alice"))
 	assert.Equals(t, response.Code, 200)
 	log.Printf("Deletion looks like: %s", response.Body.Bytes())
 	var docBody db.Body
@@ -170,15 +174,15 @@ func TestDocDeletionFromChannel(t *testing.T) {
 	assert.DeepEquals(t, docBody, db.Body{"_id": "alpha", "_rev": rev2, "_deleted": true})
 
 	// Access without deletion revID shouldn't be allowed (since doc is not in Alice's channels):
-	response = rt.send(requestByUser("GET", "/db/alpha", "", "alice"))
+	response = rt.Send(requestByUser("GET", "/db/alpha", "", "alice"))
 	assert.Equals(t, response.Code, 403)
 
 	// A bogus rev ID should return a 404:
-	response = rt.send(requestByUser("GET", "/db/alpha?rev=bogus", "", "alice"))
+	response = rt.Send(requestByUser("GET", "/db/alpha?rev=bogus", "", "alice"))
 	assert.Equals(t, response.Code, 404)
 
 	// Get the old revision, which should still be accessible:
-	response = rt.send(requestByUser("GET", "/db/alpha?rev="+rev1, "", "alice"))
+	response = rt.Send(requestByUser("GET", "/db/alpha?rev="+rev1, "", "alice"))
 	assert.Equals(t, response.Code, 200)
 }
 
@@ -191,7 +195,7 @@ func TestPostChangesInteger(t *testing.T) {
 
 func postChanges(t *testing.T, it indexTester) {
 
-	response := it.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
+	response := it.SendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
 	assert.True(t, response != nil)
 
 	// Create user:
@@ -201,13 +205,13 @@ func postChanges(t *testing.T, it indexTester) {
 	a.Save(bernard)
 
 	// Put several documents
-	response = it.sendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/abc1", `{"value":1, "channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/abc1", `{"value":1, "channel":["ABC"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	var changes struct {
@@ -215,7 +219,7 @@ func postChanges(t *testing.T, it indexTester) {
 		Last_Seq db.SequenceID
 	}
 	changesJSON := `{"style":"all_docs", "heartbeat":300000, "feed":"longpoll", "limit":50, "since":"0"}`
-	changesResponse := it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
@@ -229,7 +233,7 @@ func TestPostChangesUserTiming(t *testing.T) {
 	it := initIndexTester(false, `function(doc) {channel(doc.channel); access(doc.accessUser, doc.accessChannel)}`)
 	defer it.Close()
 
-	response := it.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
+	response := it.SendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
 	assert.True(t, response != nil)
 
 	// Create user:
@@ -241,11 +245,11 @@ func TestPostChangesUserTiming(t *testing.T) {
 	var wg sync.WaitGroup
 
 	// Put several documents to channel PBS
-	response = it.sendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	wg.Add(1)
@@ -256,18 +260,85 @@ func TestPostChangesUserTiming(t *testing.T) {
 			Last_Seq string
 		}
 		changesJSON := `{"style":"all_docs", "timeout":6000, "feed":"longpoll", "limit":50, "since":"0"}`
-		changesResponse := it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+		changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 		// Validate that the user receives backfill plus the new doc
 		err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 		assertNoError(t, err, "Error unmarshalling changes response")
+
+		if len(changes.Results) != 3 {
+			log.Printf("len(changes.Results) != 3, dumping changes response for diagnosis")
+			log.Printf("changes: %+v", changes)
+			log.Printf("changesResponse status code: %v.  Headers: %+v", changesResponse.Code, changesResponse.HeaderMap)
+			log.Printf("changesResponse raw body: %s", changesResponse.Body.String())
+		}
+		assert.Equals(t, len(changes.Results), 3)
+	}()
+
+	// Wait for changes feed to get into wait mode where it is blocked on the longpoll changes feed response
+	time.Sleep(5 * time.Second)
+
+	// Put a doc in channel bernard, that also grants bernard access to channel PBS
+	response = it.SendAdminRequest("PUT", "/db/grant1", `{"value":1, "accessUser":"bernard", "accessChannel":"PBS"}`)
+	assertStatus(t, response, 201)
+	wg.Wait()
+
+}
+
+// Tests race between waking up the changes feed, and detecting that the user doc has changed
+// This test can sporadically reproduce issue #2068, as reported in #2999#issuecomment-342681828
+// TODO: enhance this test to reproduce the issue more reliably, possibly by writing updates directly to
+// TODO: to the Couchbase bucket and introducing an artifical delay.
+func DisabledTestPostChangesUserTiming(t *testing.T) {
+
+	it := initIndexTester(false, `function(doc) {channel(doc.channel); access(doc.accessUser, doc.accessChannel)}`)
+	defer it.Close()
+
+	response := it.SendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
+	assert.True(t, response != nil)
+
+	// Create user:
+	a := it.ServerContext().Database("db").Authenticator()
+	bernard, err := a.NewUser("bernard", "letmein", channels.SetOf("bernard"))
+	assert.True(t, err == nil)
+	a.Save(bernard)
+
+	var wg sync.WaitGroup
+
+	// Put several documents to channel PBS
+	response = it.SendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var changes struct {
+			Results  []db.ChangeEntry
+			Last_Seq string
+		}
+		changesJSON := `{"style":"all_docs", "timeout":6000, "feed":"longpoll", "limit":50, "since":"0"}`
+		changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+		// Validate that the user receives backfill plus the new doc
+		err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+		assertNoError(t, err, "Error unmarshalling changes response")
+
+		if len(changes.Results) != 4 {
+			log.Printf("len(changes.Results) != 4, dumping changes response for diagnosis")
+			log.Printf("changes: %+v", changes)
+			log.Printf("changesResponse status code: %v.  Headers: %+v", changesResponse.Code, changesResponse.HeaderMap)
+			log.Printf("changesResponse raw body: %s", changesResponse.Body.String())
+		}
 		assert.Equals(t, len(changes.Results), 4)
 	}()
 
-	// Wait for changes feed to get into wait mode, even when running under race
-	time.Sleep(2 * time.Second)
+	// Wait for changes feed to get into wait mode where it is blocked on the longpoll changes feed response
+	time.Sleep(5 * time.Second)
 
 	// Put a doc in channel bernard, that also grants bernard access to channel PBS
-	response = it.sendAdminRequest("PUT", "/db/grant1", `{"value":1, "channel":["bernard"], "accessUser":"bernard", "accessChannel":"PBS"}`)
+	response = it.SendAdminRequest("PUT", "/db/grant1", `{"value":1, "channel":["bernard"], "accessUser":"bernard", "accessChannel":"PBS"}`)
 	assertStatus(t, response, 201)
 	wg.Wait()
 
@@ -284,16 +355,16 @@ func TestPostChangesWithQueryString(t *testing.T) {
 	defer it.Close()
 
 	// Put several documents
-	response := it.sendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
+	response := it.SendAdminRequest("PUT", "/db/pbs1", `{"value":1, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/abc1", `{"value":1, "channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/abc1", `{"value":1, "channel":["ABC"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2", `{"value":2, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs3", `{"value":3, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 
-	it.waitForPendingChanges()
+	it.WaitForPendingChanges()
 
 	var changes struct {
 		Results  []db.ChangeEntry
@@ -302,7 +373,7 @@ func TestPostChangesWithQueryString(t *testing.T) {
 
 	// Test basic properties
 	changesJSON := `{"heartbeat":50, "feed":"normal", "limit":1, "since":"3"}`
-	changesResponse := it.sendAdminRequest("POST", "/db/_changes?feed=longpoll&limit=10&since=0&heartbeat=50000", changesJSON)
+	changesResponse := it.SendAdminRequest("POST", "/db/_changes?feed=longpoll&limit=10&since=0&heartbeat=50000", changesJSON)
 
 	err := json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
@@ -314,7 +385,7 @@ func TestPostChangesWithQueryString(t *testing.T) {
 		Last_Seq db.SequenceID
 	}
 	changesJSON = `{"feed":"longpoll"}`
-	changesResponse = it.sendAdminRequest("POST", "/db/_changes?feed=longpoll&filter=sync_gateway/bychannel&channels=ABC", changesJSON)
+	changesResponse = it.SendAdminRequest("POST", "/db/_changes?feed=longpoll&filter=sync_gateway/bychannel&channels=ABC", changesJSON)
 
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &filteredChanges)
 	assertNoError(t, err, "Error unmarshalling changes response")
@@ -323,25 +394,25 @@ func TestPostChangesWithQueryString(t *testing.T) {
 
 // Basic _changes test with since value
 func postChangesSince(t *testing.T, it indexTester) {
-	response := it.sendAdminRequest("PUT", "/_logging", `{"*":true}`)
+	response := it.SendAdminRequest("PUT", "/_logging", `{"*":true}`)
 
 	//response := it.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
 	assert.True(t, response != nil)
 
 	// Create user
-	response = it.sendAdminRequest("PUT", "/db/_user/bernard", `{"email":"bernard@bb.com", "password":"letmein", "admin_channels":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/_user/bernard", `{"email":"bernard@bb.com", "password":"letmein", "admin_channels":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	// Put several documents
-	response = it.sendAdminRequest("PUT", "/db/pbs1-0000609", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs1-0000609", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/samevbdiffchannel-0000609", `{"channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/samevbdiffchannel-0000609", `{"channel":["ABC"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/samevbdiffchannel-0000799", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/samevbdiffchannel-0000799", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2-0000609", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2-0000609", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs3-0000609", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs3-0000609", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	var changes struct {
@@ -349,7 +420,7 @@ func postChangesSince(t *testing.T, it indexTester) {
 		Last_Seq interface{}
 	}
 	changesJSON := `{"style":"all_docs", "heartbeat":300000, "feed":"longpoll", "limit":50, "since":"0"}`
-	changesResponse := it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 
 	err := json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	log.Printf("Changes:%s", changesResponse.Body.Bytes())
@@ -357,17 +428,17 @@ func postChangesSince(t *testing.T, it indexTester) {
 	assert.Equals(t, len(changes.Results), 5)
 
 	// Put several more documents, some to the same vbuckets
-	response = it.sendAdminRequest("PUT", "/db/pbs1-0000799", `{"value":1, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs1-0000799", `{"value":1, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/abc1-0000609", `{"value":1, "channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/abc1-0000609", `{"value":1, "channel":["ABC"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2-0000799", `{"value":2, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2-0000799", `{"value":2, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs4", `{"value":4, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs4", `{"value":4, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 	time.Sleep(1 * time.Second)
 	changesJSON = fmt.Sprintf(`{"style":"all_docs", "heartbeat":300000, "feed":"longpoll", "limit":50, "since":"%s"}`, changes.Last_Seq)
-	changesResponse = it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	log.Printf("Changes:%s", changesResponse.Body.Bytes())
 	assertNoError(t, err, "Error unmarshalling changes response")
@@ -384,7 +455,7 @@ func TestPostChangesChannelFilterInteger(t *testing.T) {
 // Test _changes with channel filter
 func postChangesChannelFilter(t *testing.T, it indexTester) {
 
-	response := it.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
+	response := it.SendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
 	assert.True(t, response != nil)
 
 	// Create user:
@@ -394,15 +465,15 @@ func postChangesChannelFilter(t *testing.T, it indexTester) {
 	a.Save(bernard)
 
 	// Put several documents
-	response = it.sendAdminRequest("PUT", "/db/pbs1-0000609", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs1-0000609", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/samevbdiffchannel-0000609", `{"channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/samevbdiffchannel-0000609", `{"channel":["ABC"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/samevbdiffchannel-0000799", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/samevbdiffchannel-0000799", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2-0000609", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2-0000609", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs3-0000609", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs3-0000609", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	var changes struct {
@@ -411,23 +482,23 @@ func postChangesChannelFilter(t *testing.T, it indexTester) {
 	}
 
 	changesJSON := `{"filter":"sync_gateway/bychannel", "channels":"PBS"}`
-	changesResponse := it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	assert.Equals(t, len(changes.Results), 4)
 
 	// Put several more documents, some to the same vbuckets
-	response = it.sendAdminRequest("PUT", "/db/pbs1-0000799", `{"value":1, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs1-0000799", `{"value":1, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/abc1-0000609", `{"value":1, "channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/abc1-0000609", `{"value":1, "channel":["ABC"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs2-0000799", `{"value":2, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs2-0000799", `{"value":2, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs4", `{"value":4, "channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs4", `{"value":4, "channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 	time.Sleep(100 * time.Millisecond)
-	changesResponse = it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	for _, result := range changes.Results {
@@ -445,7 +516,7 @@ func TestPostChangesAdminChannelGrantInteger(t *testing.T) {
 
 // _changes with admin-based channel grant
 func postChangesAdminChannelGrant(t *testing.T, it indexTester) {
-	response := it.sendAdminRequest("PUT", "/_logging", `{"Backfill":true}`)
+	response := it.SendAdminRequest("PUT", "/_logging", `{"Backfill":true}`)
 
 	//response := it.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "HTTP":true, "DIndex+":true}`)
 	assert.True(t, response != nil)
@@ -457,15 +528,15 @@ func postChangesAdminChannelGrant(t *testing.T, it indexTester) {
 	a.Save(bernard)
 
 	// Put several documents in channel ABC and PBS
-	response = it.sendAdminRequest("PUT", "/db/pbs-1", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs-1", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs-2", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs-2", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs-3", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs-3", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/pbs-4", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs-4", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/abc-1", `{"channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/abc-1", `{"channel":["ABC"]}`)
 	assertStatus(t, response, 201)
 
 	var changes struct {
@@ -474,7 +545,7 @@ func postChangesAdminChannelGrant(t *testing.T, it indexTester) {
 	}
 
 	// Issue simple changes request
-	changesResponse := it.send(requestByUser("GET", "/db/_changes", "", "bernard"))
+	changesResponse := it.Send(requestByUser("GET", "/db/_changes", "", "bernard"))
 	assertStatus(t, changesResponse, 200)
 
 	log.Printf("Response:%+v", changesResponse.Body)
@@ -483,13 +554,13 @@ func postChangesAdminChannelGrant(t *testing.T, it indexTester) {
 	assert.Equals(t, len(changes.Results), 1)
 
 	// Update the user doc to grant access to PBS
-	response = it.sendAdminRequest("PUT", "/db/_user/bernard", `{"admin_channels":["ABC", "PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/_user/bernard", `{"admin_channels":["ABC", "PBS"]}`)
 	assertStatus(t, response, 200)
 
 	time.Sleep(500 * time.Millisecond)
 
 	// Issue a new changes request with since=last_seq ensure that user receives all records for channel PBS
-	changesResponse = it.send(requestByUser("GET", fmt.Sprintf("/db/_changes?since=%s", changes.Last_Seq),
+	changesResponse = it.Send(requestByUser("GET", fmt.Sprintf("/db/_changes?since=%s", changes.Last_Seq),
 		"", "bernard"))
 	assertStatus(t, changesResponse, 200)
 
@@ -502,15 +573,15 @@ func postChangesAdminChannelGrant(t *testing.T, it indexTester) {
 	assert.Equals(t, len(changes.Results), 5) // 4 PBS docs, plus the updated user doc
 
 	// Write a few more docs
-	response = it.sendAdminRequest("PUT", "/db/pbs-5", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/pbs-5", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/abc-2", `{"channel":["ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/abc-2", `{"channel":["ABC"]}`)
 	assertStatus(t, response, 201)
 
 	time.Sleep(500 * time.Millisecond)
 
 	// Issue another changes request - ensure we don't backfill again
-	changesResponse = it.send(requestByUser("GET", fmt.Sprintf("/db/_changes?since=%s", changes.Last_Seq),
+	changesResponse = it.Send(requestByUser("GET", fmt.Sprintf("/db/_changes?since=%s", changes.Last_Seq),
 		"", "bernard"))
 	assertStatus(t, changesResponse, 200)
 	log.Printf("Response:%+v", changesResponse.Body)
@@ -528,23 +599,30 @@ func postChangesAdminChannelGrant(t *testing.T, it indexTester) {
 // longpoll as well as clients doing repeated one-off changes requests - see #1309)
 func TestChangesLoopingWhenLowSequence(t *testing.T) {
 
+	if base.TestUseXattrs() {
+		t.Skip("This test cannot run in xattr mode until WriteDirect() is updated.  See https://github.com/couchbase/sync_gateway/issues/2666#issuecomment-311183219")
+	}
+
 	pendingMaxWait := uint32(5)
 	maxNum := 50
 	skippedMaxWait := uint32(120000)
 
-	shortWaitCache := &CacheConfig{
-		CachePendingSeqMaxWait: &pendingMaxWait,
-		CachePendingSeqMaxNum:  &maxNum,
-		CacheSkippedSeqMaxWait: &skippedMaxWait,
+	shortWaitConfig := &DbConfig{
+		CacheConfig: &CacheConfig{
+			CachePendingSeqMaxWait: &pendingMaxWait,
+			CachePendingSeqMaxNum:  &maxNum,
+			CacheSkippedSeqMaxWait: &skippedMaxWait,
+		},
 	}
+	rt := RestTester{SyncFn: `function(doc) {channel(doc.channel)}`, DatabaseConfig: shortWaitConfig}
+	defer rt.Close()
 
-	rt := restTester{syncFn: `function(doc) {channel(doc.channel)}`, cacheConfig: shortWaitCache}
 	testDb := rt.ServerContext().Database("db")
 
-	response := rt.sendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "Debug":true}`)
+	response := rt.SendAdminRequest("PUT", "/_logging", `{"Changes":true, "Changes+":true, "Debug":true}`)
 	// Create user:
-	assertStatus(t, rt.sendAdminRequest("GET", "/db/_user/bernard", ""), 404)
-	response = rt.sendAdminRequest("PUT", "/db/_user/bernard", `{"email":"bernard@couchbase.com", "password":"letmein", "admin_channels":["PBS"]}`)
+	assertStatus(t, rt.SendAdminRequest("GET", "/db/_user/bernard", ""), 404)
+	response = rt.SendAdminRequest("PUT", "/db/_user/bernard", `{"email":"bernard@couchbase.com", "password":"letmein", "admin_channels":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	// Simulate seq 3 and 4 being delayed - write 1,2,5,6
@@ -558,7 +636,7 @@ func TestChangesLoopingWhenLowSequence(t *testing.T) {
 		Results  []db.ChangeEntry
 		Last_Seq interface{}
 	}
-	response = rt.send(requestByUser("GET", "/db/_changes", "", "bernard"))
+	response = rt.Send(requestByUser("GET", "/db/_changes", "", "bernard"))
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, len(changes.Results), 4)
@@ -569,7 +647,7 @@ func TestChangesLoopingWhenLowSequence(t *testing.T) {
 	// Send another changes request before any changes, with the last_seq received from the last changes ("2::6")
 	changesJSON := fmt.Sprintf(`{"since":"%s"}`, changes.Last_Seq)
 	log.Printf("sending changes JSON: %s", changesJSON)
-	response = rt.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	response = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, len(changes.Results), 0)
@@ -583,7 +661,7 @@ func TestChangesLoopingWhenLowSequence(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Send another changes request with the same since ("2::6") to ensure we see data once there are changes
-	response = rt.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	response = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, len(changes.Results), 3)
@@ -595,7 +673,7 @@ func TestChangesLoopingWhenLowSequence(t *testing.T) {
 	// Send another changes request with the same since ("2::6") to ensure we see data once there are changes
 	changesJSON = fmt.Sprintf(`{"since":"%s"}`, changes.Last_Seq)
 	log.Printf("sending changes JSON: %s", changesJSON)
-	response = rt.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	response = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	log.Printf("_changes looks like: %s", response.Body.Bytes())
 	json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, len(changes.Results), 1)
@@ -603,7 +681,15 @@ func TestChangesLoopingWhenLowSequence(t *testing.T) {
 }
 
 func TestUnusedSequences(t *testing.T) {
-	for i := 0; i < 10; i++ {
+
+	// Only do 10 iterations if running against walrus.  If against a live couchbase server,
+	// just do single iteration.  (Takes approx 30s)
+	numIterations := 10
+	if !base.UnitTestUrlIsWalrus() {
+		numIterations = 1
+	}
+
+	for i := 0; i < numIterations; i++ {
 		_testConcurrentDelete(t)
 		_testConcurrentPutAsDelete(t)
 		_testConcurrentUpdate(t)
@@ -614,12 +700,13 @@ func TestUnusedSequences(t *testing.T) {
 func _testConcurrentDelete(t *testing.T) {
 	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+"})
 
-	rt := restTester{syncFn: `function(doc,oldDoc) {
+	rt := RestTester{SyncFn: `function(doc,oldDoc) {
 			 channel(doc.channel)
 		 }`}
+	defer rt.Close()
 
 	// Create doc
-	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	response := rt.SendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 	var body db.Body
 	json.Unmarshal(response.Body.Bytes(), &body)
@@ -632,7 +719,7 @@ func _testConcurrentDelete(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			deleteResponse := rt.sendAdminRequest("DELETE", fmt.Sprintf("/db/doc1?rev=%s", revId), "")
+			deleteResponse := rt.SendAdminRequest("DELETE", fmt.Sprintf("/db/doc1?rev=%s", revId), "")
 			log.Printf("Delete #%d got response code: %d", i, deleteResponse.Code)
 		}(i)
 	}
@@ -641,7 +728,7 @@ func _testConcurrentDelete(t *testing.T) {
 	// WaitForPendingChanges waits up to 2 seconds for all allocated sequences to be cached, panics on timeout
 	rt.ServerContext().Database("db").WaitForPendingChanges()
 
-	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	response = rt.SendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 
 	// Wait for writes to be processed and indexed
@@ -652,12 +739,13 @@ func _testConcurrentDelete(t *testing.T) {
 func _testConcurrentPutAsDelete(t *testing.T) {
 	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+"})
 
-	rt := restTester{syncFn: `function(doc,oldDoc) {
+	rt := RestTester{SyncFn: `function(doc,oldDoc) {
 			 channel(doc.channel)
 		 }`}
+	defer rt.Close()
 
 	// Create doc
-	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	response := rt.SendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 	var body db.Body
 	json.Unmarshal(response.Body.Bytes(), &body)
@@ -670,7 +758,7 @@ func _testConcurrentPutAsDelete(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			deleteResponse := rt.sendAdminRequest("PUT", fmt.Sprintf("/db/doc1?rev=%s", revId), `{"_deleted":true}`)
+			deleteResponse := rt.SendAdminRequest("PUT", fmt.Sprintf("/db/doc1?rev=%s", revId), `{"_deleted":true}`)
 			log.Printf("Delete #%d got response code: %d", i, deleteResponse.Code)
 		}(i)
 	}
@@ -680,7 +768,7 @@ func _testConcurrentPutAsDelete(t *testing.T) {
 	rt.ServerContext().Database("db").WaitForPendingChanges()
 
 	// Write another doc, to validate sequences restart
-	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	response = rt.SendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 
 	rt.ServerContext().Database("db").WaitForPendingChanges()
@@ -689,12 +777,13 @@ func _testConcurrentPutAsDelete(t *testing.T) {
 func _testConcurrentUpdate(t *testing.T) {
 	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+"})
 
-	rt := restTester{syncFn: `function(doc,oldDoc) {
+	rt := RestTester{SyncFn: `function(doc,oldDoc) {
 			 channel(doc.channel)
 		 }`}
+	defer rt.Close()
 
 	// Create doc
-	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	response := rt.SendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 	var body db.Body
 	json.Unmarshal(response.Body.Bytes(), &body)
@@ -707,7 +796,7 @@ func _testConcurrentUpdate(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			updateResponse := rt.sendAdminRequest("PUT", fmt.Sprintf("/db/doc1?rev=%s", revId), `{"value":10}`)
+			updateResponse := rt.SendAdminRequest("PUT", fmt.Sprintf("/db/doc1?rev=%s", revId), `{"value":10}`)
 			log.Printf("Update #%d got response code: %d", i, updateResponse.Code)
 		}(i)
 	}
@@ -717,7 +806,7 @@ func _testConcurrentUpdate(t *testing.T) {
 	rt.ServerContext().Database("db").WaitForPendingChanges()
 
 	// Write another doc, to validate sequences restart
-	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	response = rt.SendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 
 	rt.ServerContext().Database("db").WaitForPendingChanges()
@@ -726,12 +815,13 @@ func _testConcurrentUpdate(t *testing.T) {
 func _testConcurrentNewEditsFalseDelete(t *testing.T) {
 	base.ParseLogFlags([]string{"Cache", "Cache+", "Changes+", "CRUD", "CRUD+", "HTTP", "HTTP+"})
 
-	rt := restTester{syncFn: `function(doc,oldDoc) {
+	rt := RestTester{SyncFn: `function(doc,oldDoc) {
 			 channel(doc.channel)
 		 }`}
+	defer rt.Close()
 
 	// Create doc
-	response := rt.sendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
+	response := rt.SendAdminRequest("PUT", "/db/doc1", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 	var body db.Body
 	json.Unmarshal(response.Body.Bytes(), &body)
@@ -746,7 +836,7 @@ func _testConcurrentNewEditsFalseDelete(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			deleteResponse := rt.sendAdminRequest("PUT", "/db/doc1?rev=2-foo&new_edits=false", deleteRequestBody)
+			deleteResponse := rt.SendAdminRequest("PUT", "/db/doc1?rev=2-foo&new_edits=false", deleteRequestBody)
 			log.Printf("Delete #%d got response code: %d", i, deleteResponse.Code)
 		}(i)
 	}
@@ -756,7 +846,7 @@ func _testConcurrentNewEditsFalseDelete(t *testing.T) {
 	rt.ServerContext().Database("db").WaitForPendingChanges()
 
 	// Write another doc, to see where sequences are at
-	response = rt.sendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
+	response = rt.SendAdminRequest("PUT", "/db/doc2", `{"channel":"PBS"}`)
 	assertStatus(t, response, 201)
 	rt.ServerContext().Database("db").WaitForPendingChanges()
 
@@ -776,35 +866,36 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 
 	base.UpdateLogKeys(logKeys, true)
 
-	rt := restTester{syncFn: `function(doc) {channel(doc.channels)}`}
+	rt := RestTester{SyncFn: `function(doc) {channel(doc.channels)}`}
+	defer rt.Close()
 
 	// Create user1
-	response := rt.sendAdminRequest("PUT", "/db/_user/user1", `{"email":"user1@couchbase.com", "password":"letmein", "admin_channels":["alpha"]}`)
+	response := rt.SendAdminRequest("PUT", "/db/_user/user1", `{"email":"user1@couchbase.com", "password":"letmein", "admin_channels":["alpha"]}`)
 	assertStatus(t, response, 201)
 	// Create user2
-	response = rt.sendAdminRequest("PUT", "/db/_user/user2", `{"email":"user2@couchbase.com", "password":"letmein", "admin_channels":["beta"]}`)
+	response = rt.SendAdminRequest("PUT", "/db/_user/user2", `{"email":"user2@couchbase.com", "password":"letmein", "admin_channels":["beta"]}`)
 	assertStatus(t, response, 201)
 	// Create user3
-	response = rt.sendAdminRequest("PUT", "/db/_user/user3", `{"email":"user3@couchbase.com", "password":"letmein", "admin_channels":["alpha","beta"]}`)
+	response = rt.SendAdminRequest("PUT", "/db/_user/user3", `{"email":"user3@couchbase.com", "password":"letmein", "admin_channels":["alpha","beta"]}`)
 	assertStatus(t, response, 201)
 
 	// Create user4
-	response = rt.sendAdminRequest("PUT", "/db/_user/user4", `{"email":"user4@couchbase.com", "password":"letmein", "admin_channels":[]}`)
+	response = rt.SendAdminRequest("PUT", "/db/_user/user4", `{"email":"user4@couchbase.com", "password":"letmein", "admin_channels":[]}`)
 	assertStatus(t, response, 201)
 
 	// Create user5
-	response = rt.sendAdminRequest("PUT", "/db/_user/user5", `{"email":"user5@couchbase.com", "password":"letmein", "admin_channels":["*"]}`)
+	response = rt.SendAdminRequest("PUT", "/db/_user/user5", `{"email":"user5@couchbase.com", "password":"letmein", "admin_channels":["*"]}`)
 	assertStatus(t, response, 201)
 
 	//Create docs
-	assertStatus(t, rt.sendRequest("PUT", "/db/doc1", `{"channels":["alpha"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/doc2", `{"channels":["alpha"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/doc3", `{"channels":["alpha"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/doc4", `{"channels":["alpha"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/docA", `{"channels":["beta"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/docB", `{"channels":["beta"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/docC", `{"channels":["beta"]}`), 201)
-	assertStatus(t, rt.sendRequest("PUT", "/db/docD", `{"channels":["beta"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/doc1", `{"channels":["alpha"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/doc2", `{"channels":["alpha"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/doc3", `{"channels":["alpha"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/doc4", `{"channels":["alpha"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/docA", `{"channels":["beta"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/docB", `{"channels":["beta"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/docC", `{"channels":["beta"]}`), 201)
+	assertStatus(t, rt.SendRequest("PUT", "/db/docD", `{"channels":["beta"]}`), 201)
 
 	// Create struct to hold changes response
 	var changes struct {
@@ -815,7 +906,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body := `{"filter":"_doc_ids", "doc_ids":["doc4", "doc1", "docA", "b0gus"]}`
 	request, _ := http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user1", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err := json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -826,7 +917,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "docB", "docD", "doc1"]}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user2", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -837,7 +928,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1"]}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user3", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -848,7 +939,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1"]}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user4", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -858,7 +949,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1", "docA"]}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user5", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -868,7 +959,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1", "docA"]}`
 	request, _ = http.NewRequest("POST", `/db/_changes?doc_ids=["docC","doc1"]`, bytes.NewBufferString(body))
 	request.SetBasicAuth("user5", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -877,7 +968,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	//User has "*" channel access, use GET
 	request, _ = http.NewRequest("GET", `/db/_changes?filter=_doc_ids&doc_ids=["docC","doc1","docD"]`, nil)
 	request.SetBasicAuth("user5", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -886,7 +977,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	//User has "*" channel access, use GET with doc_ids plain comma separated list
 	request, _ = http.NewRequest("GET", `/db/_changes?filter=_doc_ids&doc_ids=docC,doc1,doc2,docD`, nil)
 	request.SetBasicAuth("user5", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -894,7 +985,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 
 	//Admin User
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "docA"]}`
-	response = rt.sendAdminRequest("POST", "/db/_changes", body)
+	response = rt.SendAdminRequest("POST", "/db/_changes", body)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -904,7 +995,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1"], "since":6}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user3", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -915,7 +1006,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1"], "since":6, "limit":1}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user3", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -926,7 +1017,7 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1"], "include_docs":true }`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user3", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -936,12 +1027,12 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 
 	//test parameter style=all_docs
 	//Create a conflict revision on docC
-	assertStatus(t, rt.sendRequest("POST", "/db/_bulk_docs", `{"new_edits":false, "docs": [{"_id": "docC", "_rev": "2-b4afc58d8e61a6b03390e19a89d26643","foo": "bat", "channels":["beta"]}]}`), 201)
+	assertStatus(t, rt.SendRequest("POST", "/db/_bulk_docs", `{"new_edits":false, "docs": [{"_id": "docC", "_rev": "2-b4afc58d8e61a6b03390e19a89d26643","foo": "bat", "channels":["beta"]}]}`), 201)
 
 	body = `{"filter":"_doc_ids", "doc_ids":["docC", "b0gus", "doc4", "docD", "doc1"], "style":"all_docs"}`
 	request, _ = http.NewRequest("POST", "/db/_changes", bytes.NewBufferString(body))
 	request.SetBasicAuth("user3", "letmein")
-	response = rt.send(request)
+	response = rt.Send(request)
 	assertStatus(t, response, 200)
 	err = json.Unmarshal(response.Body.Bytes(), &changes)
 	assert.Equals(t, err, nil)
@@ -951,10 +1042,199 @@ func TestOneShotChangesWithExplicitDocIds(t *testing.T) {
 
 }
 
+func updateTestDoc(rt RestTester, docid string, revid string, body string) (newRevId string, err error) {
+	path := fmt.Sprintf("/db/%s", docid)
+	if revid != "" {
+		path = fmt.Sprintf("%s?rev=%s", path, revid)
+	}
+	response := rt.SendRequest("PUT", path, body)
+	if response.Code != 200 && response.Code != 201 {
+		return "", fmt.Errorf("createDoc got unexpected response code : %d", response.Code)
+	}
+
+	var responseBody db.Body
+	json.Unmarshal(response.Body.Bytes(), &responseBody)
+	return responseBody["rev"].(string), nil
+}
+
+// Validate retrieval of various document body types using include_docs.
+func TestChangesIncludeDocs(t *testing.T) {
+	var logKeys = map[string]bool{
+		"TEST": true,
+	}
+
+	base.UpdateLogKeys(logKeys, true)
+
+	rt := RestTester{SyncFn: `function(doc) {channel(doc.channels)}`}
+	testDB := rt.GetDatabase()
+	testDB.RevsLimit = 3
+	defer rt.Close()
+
+	// Create user1
+	response := rt.SendAdminRequest("PUT", "/db/_user/user1", `{"email":"user1@couchbase.com", "password":"letmein", "admin_channels":["alpha", "beta"]}`)
+	assertStatus(t, response, 201)
+
+	//Create docs for each scenario
+	// Active
+	_, err := updateTestDoc(rt, "doc_active", "", `{"type": "active", "channels":["alpha"]}`)
+	assertNoError(t, err, "Error updating doc")
+
+	// Multi-revision
+	var revid string
+	revid, err = updateTestDoc(rt, "doc_multi_rev", "", `{"type": "active", "channels":["alpha"], "v":1}`)
+	assertNoError(t, err, "Error updating doc")
+	_, err = updateTestDoc(rt, "doc_multi_rev", revid, `{"type": "active", "channels":["alpha"], "v":2}`)
+	assertNoError(t, err, "Error updating doc")
+
+	// Tombstoned
+	revid, err = updateTestDoc(rt, "doc_tombstone", "", `{"type": "tombstone", "channels":["alpha"]}`)
+	assertNoError(t, err, "Error updating doc")
+	response = rt.SendAdminRequest("DELETE", fmt.Sprintf("/db/doc_tombstone?rev=%s", revid), "")
+	assertStatus(t, response, 200)
+
+	// Removed
+	revid, err = updateTestDoc(rt, "doc_removed", "", `{"type": "removed", "channels":["alpha"]}`)
+	assertNoError(t, err, "Error updating doc")
+	_, err = updateTestDoc(rt, "doc_removed", revid, `{"type": "removed"}`)
+	assertNoError(t, err, "Error updating doc")
+
+	// No access (no channels)
+	_, err = updateTestDoc(rt, "doc_no_channels", "", `{"type": "no_channels", "channels":["gamma"]}`)
+	assertNoError(t, err, "Error updating doc")
+
+	// No access (other channels)
+	_, err = updateTestDoc(rt, "doc_no_access", "", `{"type": "no_access", "channels":["gamma"]}`)
+	assertNoError(t, err, "Error updating doc")
+
+	// Removal, pruned from rev tree
+	var prunedRevId string
+	prunedRevId, err = updateTestDoc(rt, "doc_pruned", "", `{"type": "pruned", "channels":["alpha"]}`)
+	assertNoError(t, err, "Error updating doc")
+	// Generate more revs than revs_limit (3)
+	revid = prunedRevId
+	for i := 0; i < 5; i++ {
+		revid, err = updateTestDoc(rt, "doc_pruned", revid, `{"type": "pruned", "channels":["gamma"]}`)
+		assertNoError(t, err, "Error updating doc")
+	}
+
+	// Doc w/ attachment
+	revid, err = updateTestDoc(rt, "doc_attachment", "", `{"type": "attachments", "channels":["alpha"]}`)
+	assertNoError(t, err, "Error updating doc")
+	attachmentBody := "this is the body of attachment"
+	attachmentContentType := "text/plain"
+	reqHeaders := map[string]string{
+		"Content-Type": attachmentContentType,
+	}
+	response = rt.SendRequestWithHeaders("PUT", fmt.Sprintf("/db/doc_attachment/attach1?rev=%s", revid), attachmentBody, reqHeaders)
+	assertStatus(t, response, 201)
+
+	// Doc w/ large numbers
+	_, err = updateTestDoc(rt, "doc_large_numbers", "", `{"type": "large_numbers", "channels":["alpha"], "largeint":1234567890, "largefloat":1234567890.1234}`)
+	assertNoError(t, err, "Error updating doc")
+
+	// Conflict
+	revid, err = updateTestDoc(rt, "doc_conflict", "", `{"type": "conflict", "channels":["alpha"]}`)
+	_, err = updateTestDoc(rt, "doc_conflict", revid, `{"type": "conflict", "channels":["alpha"]}`)
+	newEdits_conflict := `{"type": "conflict", "channels":["alpha"],
+                   "_revisions": {"start": 2, "ids": ["conflicting_rev", "19a316235cdd9d695d73765dc527d903"]}}`
+	response = rt.SendAdminRequest("PUT", "/db/doc_conflict?new_edits=false", newEdits_conflict)
+	assertStatus(t, response, 201)
+
+	// Resolved conflict
+	revid, err = updateTestDoc(rt, "doc_resolved_conflict", "", `{"type": "resolved_conflict", "channels":["alpha"]}`)
+	_, err = updateTestDoc(rt, "doc_resolved_conflict", revid, `{"type": "resolved_conflict", "channels":["alpha"]}`)
+	newEdits_conflict = `{"type": "resolved_conflict", "channels":["alpha"]},
+                   "_revisions": {"start": 2, "ids": ["conflicting_rev", "4e123c0497a1a6975540977ec127c06c"]}}`
+	response = rt.SendAdminRequest("PUT", "/db/doc_resolved_conflict?new_edits=false", newEdits_conflict)
+	response = rt.SendAdminRequest("DELETE", "/db/doc_resolved_conflict?rev=2-conflicting_rev", "")
+
+	expectedResults := make([]string, 10)
+	expectedResults[0] = `{"seq":1,"id":"_user/user1","changes":[]}`
+	expectedResults[1] = `{"seq":2,"id":"doc_active","doc":{"_id":"doc_active","_rev":"1-d59fda97ac4849f6a754fbcf4b522980","channels":["alpha"],"type":"active"},"changes":[{"rev":"1-d59fda97ac4849f6a754fbcf4b522980"}]}`
+	expectedResults[2] = `{"seq":4,"id":"doc_multi_rev","doc":{"_id":"doc_multi_rev","_rev":"2-db2cf770921c3764b2d213ee0cbb5f45","channels":["alpha"],"type":"active","v":2},"changes":[{"rev":"2-db2cf770921c3764b2d213ee0cbb5f45"}]}`
+	expectedResults[3] = `{"seq":6,"id":"doc_tombstone","deleted":true,"removed":["alpha"],"doc":{"_deleted":true,"_id":"doc_tombstone","_rev":"2-5bd8eb422f30e8d455940672e9e76549"},"changes":[{"rev":"2-5bd8eb422f30e8d455940672e9e76549"}]}`
+	expectedResults[4] = `{"seq":8,"id":"doc_removed","removed":["alpha"],"doc":{"_id":"doc_removed","_removed":true,"_rev":"2-d15cb77d1dbe1cc06d27310de5b75914"},"changes":[{"rev":"2-d15cb77d1dbe1cc06d27310de5b75914"}]}`
+	expectedResults[5] = `{"seq":12,"id":"doc_pruned","removed":["alpha"],"doc":{"_id":"doc_pruned","_removed":true,"_rev":"2-5afcb73bd3eb50615470e3ba54b80f00"},"changes":[{"rev":"2-5afcb73bd3eb50615470e3ba54b80f00"}]}`
+	expectedResults[6] = `{"seq":18,"id":"doc_attachment","doc":{"_attachments":{"attach1":{"content_type":"text/plain","digest":"sha1-nq0xWBV2IEkkpY3ng+PEtFnCcVY=","length":30,"revpos":2,"stub":true}},"_id":"doc_attachment","_rev":"2-0db6aecd6b91981e7f97c95ca64b5019","channels":["alpha"],"type":"attachments"},"changes":[{"rev":"2-0db6aecd6b91981e7f97c95ca64b5019"}]}`
+	expectedResults[7] = `{"seq":19,"id":"doc_large_numbers","doc":{"_id":"doc_large_numbers","_rev":"1-2721633d9000e606e9c642e98f2f5ae7","channels":["alpha"],"largefloat":1234567890.1234,"largeint":1234567890,"type":"large_numbers"},"changes":[{"rev":"1-2721633d9000e606e9c642e98f2f5ae7"}]}`
+	expectedResults[8] = `{"seq":22,"id":"doc_conflict","doc":{"_id":"doc_conflict","_rev":"2-conflicting_rev","channels":["alpha"],"type":"conflict"},"changes":[{"rev":"2-conflicting_rev"}]}`
+	expectedResults[9] = `{"seq":24,"id":"doc_resolved_conflict","doc":{"_id":"doc_resolved_conflict","_rev":"2-251ba04e5889887152df5e7a350745b4","channels":["alpha"],"type":"resolved_conflict"},"changes":[{"rev":"2-251ba04e5889887152df5e7a350745b4"}]}`
+	changesResponse := rt.Send(requestByUser("GET", "/db/_changes?include_docs=true", "", "user1"))
+
+	// If we unmarshal results to db.ChangeEntry, json numbers get mangled by the test.  Validate against RawMessage to simplify.
+	var changes struct {
+		Results []*json.RawMessage
+	}
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), len(expectedResults))
+
+	for index, result := range changes.Results {
+		assert.Equals(t, fmt.Sprintf("%s", *result), expectedResults[index])
+	}
+
+	// Flush the rev cache, and issue changes again to ensure successful handling for rev cache misses
+	testDB.FlushRevisionCache()
+	// Also nuke temporary revision backup of doc_pruned.  Validates that the body for the pruned revision is generated correctly when no longer resident in the rev cache
+	testDB.Bucket.Delete("_sync:rev:doc_pruned:34:2-5afcb73bd3eb50615470e3ba54b80f00")
+
+	postFlushChangesResponse := rt.Send(requestByUser("GET", "/db/_changes?include_docs=true", "", "user1"))
+
+	var postFlushChanges struct {
+		Results []*json.RawMessage
+	}
+	err = json.Unmarshal(postFlushChangesResponse.Body.Bytes(), &postFlushChanges)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(postFlushChanges.Results), len(expectedResults))
+
+	for index, result := range postFlushChanges.Results {
+		assert.Equals(t, fmt.Sprintf("%s", *result), expectedResults[index])
+	}
+
+	// Validate include_docs=false, style=all_docs permutations
+	expectedStyleAllDocs := make([]string, 10)
+	expectedStyleAllDocs[0] = `{"seq":1,"id":"_user/user1","changes":[]}`
+	expectedStyleAllDocs[1] = `{"seq":2,"id":"doc_active","changes":[{"rev":"1-d59fda97ac4849f6a754fbcf4b522980"}]}`
+	expectedStyleAllDocs[2] = `{"seq":4,"id":"doc_multi_rev","changes":[{"rev":"2-db2cf770921c3764b2d213ee0cbb5f45"}]}`
+	expectedStyleAllDocs[3] = `{"seq":6,"id":"doc_tombstone","deleted":true,"removed":["alpha"],"changes":[{"rev":"2-5bd8eb422f30e8d455940672e9e76549"}]}`
+	expectedStyleAllDocs[4] = `{"seq":8,"id":"doc_removed","removed":["alpha"],"changes":[{"rev":"2-d15cb77d1dbe1cc06d27310de5b75914"}]}`
+	expectedStyleAllDocs[5] = `{"seq":12,"id":"doc_pruned","removed":["alpha"],"changes":[{"rev":"2-5afcb73bd3eb50615470e3ba54b80f00"}]}`
+	expectedStyleAllDocs[6] = `{"seq":18,"id":"doc_attachment","changes":[{"rev":"2-0db6aecd6b91981e7f97c95ca64b5019"}]}`
+	expectedStyleAllDocs[7] = `{"seq":19,"id":"doc_large_numbers","changes":[{"rev":"1-2721633d9000e606e9c642e98f2f5ae7"}]}`
+	expectedStyleAllDocs[8] = `{"seq":22,"id":"doc_conflict","changes":[{"rev":"2-conflicting_rev"},{"rev":"2-869a7167ccbad634753105568055bd61"}]}`
+	expectedStyleAllDocs[9] = `{"seq":24,"id":"doc_resolved_conflict","changes":[{"rev":"2-251ba04e5889887152df5e7a350745b4"}]}`
+
+	styleAllDocsChangesResponse := rt.Send(requestByUser("GET", "/db/_changes?style=all_docs", "", "user1"))
+	var allDocsChanges struct {
+		Results []*json.RawMessage
+	}
+	err = json.Unmarshal(styleAllDocsChangesResponse.Body.Bytes(), &allDocsChanges)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(allDocsChanges.Results), len(expectedStyleAllDocs))
+	for index, result := range allDocsChanges.Results {
+		assert.Equals(t, fmt.Sprintf("%s", *result), expectedStyleAllDocs[index])
+	}
+
+	// Validate style=all_docs, include_docs=true permutations.  Only modified doc from include_docs test is doc_conflict (adds open revisions)
+	expectedResults[8] = `{"seq":22,"id":"doc_conflict","doc":{"_id":"doc_conflict","_rev":"2-conflicting_rev","channels":["alpha"],"type":"conflict"},"changes":[{"rev":"2-conflicting_rev"},{"rev":"2-869a7167ccbad634753105568055bd61"}]}`
+
+	combinedChangesResponse := rt.Send(requestByUser("GET", "/db/_changes?style=all_docs&include_docs=true", "", "user1"))
+	var combinedChanges struct {
+		Results []*json.RawMessage
+	}
+
+	err = json.Unmarshal(combinedChangesResponse.Body.Bytes(), &combinedChanges)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(combinedChanges.Results), len(expectedResults))
+	for index, result := range combinedChanges.Results {
+		assert.Equals(t, fmt.Sprintf("%s", *result), expectedResults[index])
+	}
+}
+
 // Test _changes with channel filter
 func changesActiveOnly(t *testing.T, it indexTester) {
 
-	response := it.sendAdminRequest("PUT", "/_logging", `{"HTTP":true, "Changes":true}`)
+	response := it.SendAdminRequest("PUT", "/_logging", `{"HTTP":true, "Changes":true}`)
 	assert.True(t, response != nil)
 
 	// Create user:
@@ -965,32 +1245,32 @@ func changesActiveOnly(t *testing.T, it indexTester) {
 
 	// Put several documents
 	var body db.Body
-	response = it.sendAdminRequest("PUT", "/db/deletedDoc", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/deletedDoc", `{"channel":["PBS"]}`)
 	json.Unmarshal(response.Body.Bytes(), &body)
 	deletedRev := body["rev"].(string)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/removedDoc", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/removedDoc", `{"channel":["PBS"]}`)
 	json.Unmarshal(response.Body.Bytes(), &body)
 	removedRev := body["rev"].(string)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/activeDoc", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("PUT", "/db/partialRemovalDoc", `{"channel":["PBS","ABC"]}`)
+	response = it.SendAdminRequest("PUT", "/db/partialRemovalDoc", `{"channel":["PBS","ABC"]}`)
 	json.Unmarshal(response.Body.Bytes(), &body)
 	partialRemovalRev := body["rev"].(string)
 	assertStatus(t, response, 201)
 
-	response = it.sendAdminRequest("PUT", "/db/conflictedDoc", `{"channel":["PBS"]}`)
+	response = it.SendAdminRequest("PUT", "/db/conflictedDoc", `{"channel":["PBS"]}`)
 	assertStatus(t, response, 201)
 
 	// Create a conflict, then tombstone it
-	response = it.sendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictTombstone"}], "new_edits":false}`)
+	response = it.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictTombstone"}], "new_edits":false}`)
 	assertStatus(t, response, 201)
-	response = it.sendAdminRequest("DELETE", "/db/conflictedDoc?rev=1-conflictTombstone", "")
+	response = it.SendAdminRequest("DELETE", "/db/conflictedDoc?rev=1-conflictTombstone", "")
 	assertStatus(t, response, 200)
 
 	// Create a conflict, and don't tombstone it
-	response = it.sendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictActive"}], "new_edits":false}`)
+	response = it.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictActive"}], "new_edits":false}`)
 	assertStatus(t, response, 201)
 
 	var changes struct {
@@ -1000,28 +1280,28 @@ func changesActiveOnly(t *testing.T, it indexTester) {
 
 	// Pre-delete changes
 	changesJSON := `{"style":"all_docs"}`
-	changesResponse := it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	assert.Equals(t, len(changes.Results), 5)
 
 	// Delete
-	response = it.sendAdminRequest("DELETE", fmt.Sprintf("/db/deletedDoc?rev=%s", deletedRev), "")
+	response = it.SendAdminRequest("DELETE", fmt.Sprintf("/db/deletedDoc?rev=%s", deletedRev), "")
 	assertStatus(t, response, 200)
 
 	// Removed
-	response = it.sendAdminRequest("PUT", "/db/removedDoc", fmt.Sprintf(`{"_rev":%q, "channel":["HBO"]}`, removedRev))
+	response = it.SendAdminRequest("PUT", "/db/removedDoc", fmt.Sprintf(`{"_rev":%q, "channel":["HBO"]}`, removedRev))
 	assertStatus(t, response, 201)
 
 	// Partially removed
-	response = it.sendAdminRequest("PUT", "/db/partialRemovalDoc", fmt.Sprintf(`{"_rev":%q, "channel":["PBS"]}`, partialRemovalRev))
+	response = it.SendAdminRequest("PUT", "/db/partialRemovalDoc", fmt.Sprintf(`{"_rev":%q, "channel":["PBS"]}`, partialRemovalRev))
 	assertStatus(t, response, 201)
 
 	time.Sleep(100 * time.Millisecond)
 
 	// Normal changes
 	changesJSON = `{"style":"all_docs"}`
-	changesResponse = it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	assert.Equals(t, len(changes.Results), 5)
@@ -1035,7 +1315,7 @@ func changesActiveOnly(t *testing.T, it indexTester) {
 	// Active only, POST
 	changesJSON = `{"style":"all_docs", "active_only":true}`
 	changes.Results = nil
-	changesResponse = it.send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	assert.Equals(t, len(changes.Results), 3)
@@ -1048,7 +1328,7 @@ func changesActiveOnly(t *testing.T, it indexTester) {
 	}
 	// Active only, GET
 	changes.Results = nil
-	changesResponse = it.send(requestByUser("GET", "/db/_changes?style=all_docs&active_only=true", "", "bernard"))
+	changesResponse = it.Send(requestByUser("GET", "/db/_changes?style=all_docs&active_only=true", "", "bernard"))
 	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
 	assertNoError(t, err, "Error unmarshalling changes response")
 	assert.Equals(t, len(changes.Results), 3)
@@ -1058,6 +1338,618 @@ func changesActiveOnly(t *testing.T, it indexTester) {
 			assert.Equals(t, len(entry.Changes), 2)
 		}
 	}
+}
+
+// Tests view backfill and validates that results are prepended to cache
+func TestChangesViewBackfill(t *testing.T) {
+	rt := RestTester{SyncFn: `function(doc, oldDoc){channel(doc.channels);}`}
+	defer rt.Close()
+
+	response := rt.SendAdminRequest("PUT", "/_logging", `{"HTTP":true, "Changes":true, "Changes+":true, "Cache":true, "Cache+":true}`)
+	assert.True(t, response != nil)
+
+	// Create user:
+	a := rt.ServerContext().Database("db").Authenticator()
+	bernard, err := a.NewUser("bernard", "letmein", channels.SetOf("PBS", "ABC"))
+	assert.True(t, err == nil)
+	a.Save(bernard)
+
+	// Put several documents
+	response = rt.SendAdminRequest("PUT", "/db/doc1", `{"channels":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/doc2", `{"channels":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/doc3", `{"channels":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	testDb := rt.ServerContext().Database("db")
+	testDb.WaitForSequence(3)
+
+	// Flush the channel cache
+	testDb.FlushChannelCache()
+
+	// Add a few more docs (to increment the channel cache's validFrom)
+	response = rt.SendAdminRequest("PUT", "/db/doc4", `{"channels":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	response = rt.SendAdminRequest("PUT", "/db/doc5", `{"channels":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	testDb.WaitForSequence(5)
+
+	// Issue a since=0 changes request.  Validate that there's a view-based backfill
+	var changes struct {
+		Results  []db.ChangeEntry
+		Last_Seq interface{}
+	}
+	changesJSON := `{"since":0}`
+	changes.Results = nil
+	changesResponse := rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+	}
+	queryCount := base.GetExpvarAsString("syncGateway_changeCache", "view_queries")
+	log.Printf("After initial changes request, query count is :%s", queryCount)
+
+	// Issue another since=0 changes request.  Validate that there is not another a view-based backfill
+	changes.Results = nil
+	changesResponse = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+	}
+	// Validate that there haven't been any more view queries
+	assert.Equals(t, base.GetExpvarAsString("syncGateway_changeCache", "view_queries"), queryCount)
+
+}
+
+func TestChangesActiveOnlyWithLimit(t *testing.T) {
+
+	it := initIndexTester(false, `function(doc) {channel(doc.channel);}`)
+	defer it.Close()
+
+	response := it.SendAdminRequest("PUT", "/_logging", `{"HTTP":true, "Changes":true}`)
+	assert.True(t, response != nil)
+
+	// Create user:
+	a := it.ServerContext().Database("db").Authenticator()
+	bernard, err := a.NewUser("bernard", "letmein", channels.SetOf("PBS", "ABC"))
+	assert.True(t, err == nil)
+	a.Save(bernard)
+
+	// Put several documents
+	var body db.Body
+	response = it.SendAdminRequest("PUT", "/db/deletedDoc", `{"channel":["PBS"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	deletedRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/removedDoc", `{"channel":["PBS"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	removedRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc0", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	response = it.SendAdminRequest("PUT", "/db/partialRemovalDoc", `{"channel":["PBS","ABC"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	partialRemovalRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+
+	response = it.SendAdminRequest("PUT", "/db/conflictedDoc", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	// Create a conflict, then tombstone it
+	response = it.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictTombstone"}], "new_edits":false}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("DELETE", "/db/conflictedDoc?rev=1-conflictTombstone", "")
+	assertStatus(t, response, 200)
+
+	// Create a conflict, and don't tombstone it
+	response = it.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictActive"}], "new_edits":false}`)
+	assertStatus(t, response, 201)
+
+	var changes struct {
+		Results  []db.ChangeEntry
+		Last_Seq interface{}
+	}
+
+	// Pre-delete changes
+	changesJSON := `{"style":"all_docs"}`
+	changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+
+	// Delete
+	response = it.SendAdminRequest("DELETE", fmt.Sprintf("/db/deletedDoc?rev=%s", deletedRev), "")
+	assertStatus(t, response, 200)
+
+	// Removed
+	response = it.SendAdminRequest("PUT", "/db/removedDoc", fmt.Sprintf(`{"_rev":%q, "channel":["HBO"]}`, removedRev))
+	assertStatus(t, response, 201)
+
+	// Partially removed
+	response = it.SendAdminRequest("PUT", "/db/partialRemovalDoc", fmt.Sprintf(`{"_rev":%q, "channel":["PBS"]}`, partialRemovalRev))
+	assertStatus(t, response, 201)
+
+	//Create additional active docs
+	response = it.SendAdminRequest("PUT", "/db/activeDoc1", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc2", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc3", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc4", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc5", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	// TODO: Make db.waitForSequence public and use that instead of a sleep here
+	time.Sleep(100 * time.Millisecond)
+
+	// Normal changes
+	changesJSON = `{"style":"all_docs"}`
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 10)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 3)
+		}
+	}
+
+	// Active only NO Limit, POST
+	changesJSON = `{"style":"all_docs", "active_only":true}`
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit, POST
+	changesJSON = `{"style":"all_docs", "active_only":true, "limit":5}`
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+	// Active only with Limit, GET
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("GET", "/db/_changes?style=all_docs&active_only=true&limit=5", "", "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit set higher than number of revisions, POST
+	changesJSON = `{"style":"all_docs", "active_only":true, "limit":15}`
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+}
+
+// Test active-only and limit handling during cache backfill from the view.  Flushes the channel cache
+// prior to changes requests in order to force view backfill.  Covers https://github.com/couchbase/sync_gateway/issues/2955 in
+// additional to general view handling.
+func TestChangesActiveOnlyWithLimitAndViewBackfill(t *testing.T) {
+
+	it := initIndexTester(false, `function(doc) {channel(doc.channel);}`)
+	defer it.Close()
+
+	response := it.SendAdminRequest("PUT", "/_logging", `{"HTTP":true, "Changes":true, "Changes+":true, "Cache":true, "Cache+":true}`)
+	assert.True(t, response != nil)
+
+	// Create user:
+	a := it.ServerContext().Database("db").Authenticator()
+	bernard, err := a.NewUser("bernard", "letmein", channels.SetOf("PBS", "ABC"))
+	assert.True(t, err == nil)
+	a.Save(bernard)
+
+	// Put several documents
+	var body db.Body
+	response = it.SendAdminRequest("PUT", "/db/deletedDoc", `{"channel":["PBS"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	deletedRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/removedDoc", `{"channel":["PBS"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	removedRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc0", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	response = it.SendAdminRequest("PUT", "/db/partialRemovalDoc", `{"channel":["PBS","ABC"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	partialRemovalRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+
+	response = it.SendAdminRequest("PUT", "/db/conflictedDoc", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	// Create a conflict, then tombstone it
+	response = it.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictTombstone"}], "new_edits":false}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("DELETE", "/db/conflictedDoc?rev=1-conflictTombstone", "")
+	assertStatus(t, response, 200)
+
+	// Create a conflict, and don't tombstone it
+	response = it.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictActive"}], "new_edits":false}`)
+	assertStatus(t, response, 201)
+
+	var changes struct {
+		Results  []db.ChangeEntry
+		Last_Seq interface{}
+	}
+
+	// Get pre-delete changes
+	changesJSON := `{"style":"all_docs"}`
+	changesResponse := it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+
+	// Delete
+	response = it.SendAdminRequest("DELETE", fmt.Sprintf("/db/deletedDoc?rev=%s", deletedRev), "")
+	assertStatus(t, response, 200)
+
+	// Removed
+	response = it.SendAdminRequest("PUT", "/db/removedDoc", fmt.Sprintf(`{"_rev":%q, "channel":["HBO"]}`, removedRev))
+	assertStatus(t, response, 201)
+
+	// Partially removed
+	response = it.SendAdminRequest("PUT", "/db/partialRemovalDoc", fmt.Sprintf(`{"_rev":%q, "channel":["PBS"]}`, partialRemovalRev))
+	assertStatus(t, response, 201)
+
+	//Create additional active docs
+	response = it.SendAdminRequest("PUT", "/db/activeDoc1", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc2", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc3", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc4", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = it.SendAdminRequest("PUT", "/db/activeDoc5", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	// TODO: Make db.waitForSequence public and use that instead of a sleep here
+	time.Sleep(100 * time.Millisecond)
+
+	// Normal changes
+	changesJSON = `{"style":"all_docs"}`
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 10)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 3)
+		}
+	}
+
+	// Active only NO Limit, POST
+	testDb := it.ServerContext().Database("db")
+	testDb.FlushChannelCache()
+
+	changesJSON = `{"style":"all_docs", "active_only":true}`
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit, POST
+	testDb.FlushChannelCache()
+	changesJSON = `{"style":"all_docs", "active_only":true, "limit":5}`
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit, GET
+	testDb.FlushChannelCache()
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("GET", "/db/_changes?style=all_docs&active_only=true&limit=5", "", "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit set higher than number of revisions, POST
+	testDb.FlushChannelCache()
+	changesJSON = `{"style":"all_docs", "active_only":true, "limit":15}`
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// No limit active only, GET, followed by normal (https://github.com/couchbase/sync_gateway/issues/2955)
+	testDb.FlushChannelCache()
+	changes.Results = nil
+	changesResponse = it.Send(requestByUser("GET", "/db/_changes?style=all_docs&active_only=true", "", "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	var updatedChanges struct {
+		Results  []db.ChangeEntry
+		Last_Seq interface{}
+	}
+	changesResponse = it.Send(requestByUser("GET", "/db/_changes", "", "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &updatedChanges)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(updatedChanges.Results), 10)
+
+}
+
+func TestChangesActiveOnlyWithLimitLowRevCache(t *testing.T) {
+
+	cacheSize := 2
+	shortWaitConfig := &DbConfig{
+		CacheConfig: &CacheConfig{
+			ChannelCacheMinLength: &cacheSize,
+			ChannelCacheMaxLength: &cacheSize,
+		},
+	}
+
+	rt := RestTester{SyncFn: `function(doc) {channel(doc.channel)}`, DatabaseConfig: shortWaitConfig}
+	defer rt.Close()
+
+	///it := initIndexTester(false, `function(doc) {channel(doc.channel);}`)
+	//defer it.Close()
+
+	response := rt.SendAdminRequest("PUT", "/_logging", `{"HTTP":true, "Changes":true, "Cache":true}`)
+	assert.True(t, response != nil)
+
+	// Create user:
+	a := rt.ServerContext().Database("db").Authenticator()
+	bernard, err := a.NewUser("bernard", "letmein", channels.SetOf("PBS", "ABC"))
+	assert.True(t, err == nil)
+	a.Save(bernard)
+
+	// Put several documents
+	var body db.Body
+	response = rt.SendAdminRequest("PUT", "/db/deletedDoc", `{"channel":["PBS"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	deletedRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/removedDoc", `{"channel":["PBS"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	removedRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/activeDoc0", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	response = rt.SendAdminRequest("PUT", "/db/partialRemovalDoc", `{"channel":["PBS","ABC"]}`)
+	json.Unmarshal(response.Body.Bytes(), &body)
+	partialRemovalRev := body["rev"].(string)
+	assertStatus(t, response, 201)
+
+	response = rt.SendAdminRequest("PUT", "/db/conflictedDoc", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	// Create a conflict, then tombstone it
+	response = rt.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictTombstone"}], "new_edits":false}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("DELETE", "/db/conflictedDoc?rev=1-conflictTombstone", "")
+	assertStatus(t, response, 200)
+
+	// Create a conflict, and don't tombstone it
+	response = rt.SendAdminRequest("POST", "/db/_bulk_docs", `{"docs":[{"_id":"conflictedDoc","channel":["PBS"], "_rev":"1-conflictActive"}], "new_edits":false}`)
+	assertStatus(t, response, 201)
+
+	var changes struct {
+		Results  []db.ChangeEntry
+		Last_Seq interface{}
+	}
+
+	// Get pre-delete changes
+	changesJSON := `{"style":"all_docs"}`
+	changesResponse := rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+
+	// Delete
+	response = rt.SendAdminRequest("DELETE", fmt.Sprintf("/db/deletedDoc?rev=%s", deletedRev), "")
+	assertStatus(t, response, 200)
+
+	// Removed
+	response = rt.SendAdminRequest("PUT", "/db/removedDoc", fmt.Sprintf(`{"_rev":%q, "channel":["HBO"]}`, removedRev))
+	assertStatus(t, response, 201)
+
+	// Partially removed
+	response = rt.SendAdminRequest("PUT", "/db/partialRemovalDoc", fmt.Sprintf(`{"_rev":%q, "channel":["PBS"]}`, partialRemovalRev))
+	assertStatus(t, response, 201)
+
+	//Create additional active docs
+	response = rt.SendAdminRequest("PUT", "/db/activeDoc1", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/activeDoc2", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/activeDoc3", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/activeDoc4", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/activeDoc5", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Normal changes
+	changesJSON = `{"style":"all_docs"}`
+	changesResponse = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 10)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 3)
+		}
+	}
+
+	// Active only NO Limit, POST
+	changesJSON = `{"style":"all_docs", "active_only":true}`
+	changes.Results = nil
+	changesResponse = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit, POST
+	changesJSON = `{"style":"all_docs", "active_only":true, "limit":5}`
+	changes.Results = nil
+	changesResponse = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+	// Active only with Limit, GET
+	changes.Results = nil
+	changesResponse = rt.Send(requestByUser("GET", "/db/_changes?style=all_docs&active_only=true&limit=5", "", "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 5)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+
+	// Active only with Limit set higher than number of revisions, POST
+	changesJSON = `{"style":"all_docs", "active_only":true, "limit":15}`
+	changes.Results = nil
+	changesResponse = rt.Send(requestByUser("POST", "/db/_changes", changesJSON, "bernard"))
+	err = json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 8)
+	for _, entry := range changes.Results {
+		log.Printf("Entry:%+v", entry)
+		// validate conflicted handling
+		if entry.ID == "conflictedDoc" {
+			assert.Equals(t, len(entry.Changes), 2)
+		}
+	}
+}
+
+// Test _changes returning conflicts
+func TestChangesIncludeConflicts(t *testing.T) {
+
+	base.ParseLogFlags([]string{"Cache+", "Changes+", "CRUD+"})
+	rt := RestTester{SyncFn: `function(doc,oldDoc) {
+			 channel(doc.channel)
+		 }`}
+	defer rt.Close()
+
+	// Create conflicted document documents
+	response := rt.SendAdminRequest("PUT", "/db/conflictedDoc", `{"channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	// Create two conflicting revisions
+	response = rt.SendAdminRequest("PUT", "/db/conflictedDoc?new_edits=false", `{"_revisions":{"start":2, "ids":["conflictOne", "82214a562e80c8fa7b2361719847bc73"]}, "value":"c1", "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+	response = rt.SendAdminRequest("PUT", "/db/conflictedDoc?new_edits=false", `{"_revisions":{"start":2, "ids":["conflictTwo", "82214a562e80c8fa7b2361719847bc73"]}, "value":"c2", "channel":["PBS"]}`)
+	assertStatus(t, response, 201)
+
+	var changes struct {
+		Results  []db.ChangeEntry
+		Last_Seq interface{}
+	}
+
+	// Get changes
+	rt.ServerContext().Database("db").WaitForPendingChanges()
+
+	changesResponse := rt.SendAdminRequest("GET", "/db/_changes?style=all_docs", "")
+	err := json.Unmarshal(changesResponse.Body.Bytes(), &changes)
+	log.Printf("changes response: %s", changesResponse.Body.Bytes())
+	assertNoError(t, err, "Error unmarshalling changes response")
+	assert.Equals(t, len(changes.Results), 1)
+	assert.Equals(t, len(changes.Results[0].Changes), 2)
 
 }
 
@@ -1075,40 +1967,16 @@ func assertTrue(t *testing.T, success bool, message string) {
 	}
 }
 
-/*
-// Index partitions for testing
-func SeedPartitionMap(bucket base.Bucket, numPartitions uint16) error {
-	maxVbNo := uint16(1024)
-	partitionDefs := make(base.PartitionStorageSet, numPartitions)
-	vbPerPartition := maxVbNo / numPartitions
-	for partition := uint16(0); partition < numPartitions; partition++ {
-		storage := base.PartitionStorage{
-			Index: partition,
-			VbNos: make([]uint16, vbPerPartition),
-		}
-		for index := uint16(0); index < vbPerPartition; index++ {
-			vb := partition*vbPerPartition + index
-			storage.VbNos[index] = append(storage.VbNos, vb)
-		}
-		partitionDefs[partition] = storage
-	}
-
-	// Persist to bucket
-	value, err := json.Marshal(partitionDefs)
-	if err != nil {
-		return err
-	}
-	bucket.SetRaw(base.KIndexPartitionKey, 0, value)
-	return nil
-}
-*/
-
 func WriteDirect(testDb *db.DatabaseContext, channelArray []string, sequence uint64) {
 	docId := fmt.Sprintf("doc-%v", sequence)
 	WriteDirectWithKey(testDb, docId, channelArray, sequence)
 }
 
 func WriteDirectWithKey(testDb *db.DatabaseContext, key string, channelArray []string, sequence uint64) {
+
+	if base.TestUseXattrs() {
+		panic(fmt.Sprintf("WriteDirectWithKey() cannot be used in tests that are xattr enabled"))
+	}
 
 	rev := "1-a"
 	chanMap := make(map[string]*channels.ChannelRemoval, 10)

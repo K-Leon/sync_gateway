@@ -14,9 +14,68 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/couchbase/gocb"
 	"github.com/couchbase/gomemcached"
 	sgbucket "github.com/couchbase/sg-bucket"
+	pkgerrors "github.com/pkg/errors"
 )
+
+type sgErrorCode uint16
+
+const (
+	alreadyImported       = sgErrorCode(0x00)
+	importCancelled       = sgErrorCode(0x01)
+	importCasFailure      = sgErrorCode(0x02)
+	viewTimeoutError      = sgErrorCode(0x03)
+	revTreeAddRevFailure  = sgErrorCode(0x04)
+	importCancelledFilter = sgErrorCode(0x05)
+	documentMigrated      = sgErrorCode(0x06)
+	fatalBucketConnection = sgErrorCode(0x07)
+	emptyMetadata         = sgErrorCode(0x08)
+	casFailureShouldRetry = sgErrorCode(0x09)
+)
+
+type SGError struct {
+	code sgErrorCode
+}
+
+var (
+	ErrRevTreeAddRevFailure  = &SGError{revTreeAddRevFailure}
+	ErrImportCancelled       = &SGError{importCancelled}
+	ErrAlreadyImported       = &SGError{alreadyImported}
+	ErrImportCasFailure      = &SGError{importCasFailure}
+	ErrViewTimeoutError      = &SGError{viewTimeoutError}
+	ErrImportCancelledFilter = &SGError{importCancelledFilter}
+	ErrDocumentMigrated      = &SGError{documentMigrated}
+	ErrFatalBucketConnection = &SGError{fatalBucketConnection}
+	ErrEmptyMetadata         = &SGError{emptyMetadata}
+	ErrCasFailureShouldRetry = &SGError{casFailureShouldRetry}
+)
+
+func (e SGError) Error() string {
+	switch e.code {
+	case alreadyImported:
+		return "Document already imported"
+	case importCancelled:
+		return "Import cancelled"
+	case documentMigrated:
+		return "Document migrated"
+	case importCancelledFilter:
+		return "Import cancelled based on import filter"
+	case importCasFailure:
+		return "CAS failure during import"
+	case revTreeAddRevFailure:
+		return "Failure adding Rev to RevTree"
+	case viewTimeoutError:
+		return "Timeout performing ViewQuery - could indicate that views are still reindexing"
+	case fatalBucketConnection:
+		return "Fatal error connecting to bucket"
+	case emptyMetadata:
+		return "Empty Sync Gateway metadata"
+	default:
+		return "Unknown error"
+	}
+}
 
 // Simple error implementation wrapping an HTTP response status.
 type HTTPError struct {
@@ -38,29 +97,50 @@ func ErrorAsHTTPStatus(err error) (int, string) {
 	if err == nil {
 		return 200, "OK"
 	}
-	switch err := err.(type) {
+
+	unwrappedErr := pkgerrors.Cause(err)
+
+	// Check for SGErrors
+	switch unwrappedErr {
+	case gocb.ErrKeyNotFound:
+		return http.StatusNotFound, "missing"
+	case gocb.ErrKeyExists:
+		return http.StatusConflict, "Conflict"
+	case gocb.ErrTimeout:
+		return http.StatusServiceUnavailable, "Database timeout error (gocb.ErrTimeout)"
+	case gocb.ErrOverload:
+		return http.StatusServiceUnavailable, "Database server is over capacity (gocb.ErrOverload)"
+	case gocb.ErrBusy:
+		return http.StatusServiceUnavailable, "Database server is over capacity (gocb.ErrBusy)"
+	case gocb.ErrTmpFail:
+		return http.StatusServiceUnavailable, "Database server is over capacity (gocb.ErrTmpFail)"
+	case ErrViewTimeoutError:
+		return http.StatusServiceUnavailable, unwrappedErr.Error()
+	}
+
+	switch unwrappedErr := unwrappedErr.(type) {
 	case *HTTPError:
-		return err.Status, err.Message
+		return unwrappedErr.Status, unwrappedErr.Message
 	case *gomemcached.MCResponse:
-		switch err.Status {
+		switch unwrappedErr.Status {
 		case gomemcached.KEY_ENOENT:
 			return http.StatusNotFound, "missing"
 		case gomemcached.KEY_EEXISTS:
 			return http.StatusConflict, "Conflict"
 		case gomemcached.E2BIG:
-			return http.StatusRequestEntityTooLarge, "Too Large: " + string(err.Body)
+			return http.StatusRequestEntityTooLarge, "Too Large: " + string(unwrappedErr.Body)
 		case gomemcached.TMPFAIL:
-			return http.StatusServiceUnavailable, "Database server is over capacity"
+			return http.StatusServiceUnavailable, "Database server is over capacity (gomemcached.TMPFAIL)"
 		default:
 			return http.StatusBadGateway, fmt.Sprintf("%s (%s)",
-				string(err.Body), err.Status.String())
+				string(unwrappedErr.Body), unwrappedErr.Status.String())
 		}
 	case sgbucket.MissingError:
 		return http.StatusNotFound, "missing"
 	case *json.SyntaxError, *json.UnmarshalTypeError:
-		return http.StatusBadRequest, fmt.Sprintf("Invalid JSON: \"%v\"", err)
+		return http.StatusBadRequest, fmt.Sprintf("Invalid JSON: \"%v\"", unwrappedErr)
 	}
-	return http.StatusInternalServerError, fmt.Sprintf("Internal error: %v", err)
+	return http.StatusInternalServerError, fmt.Sprintf("Internal error: %v", unwrappedErr)
 }
 
 // Returns the standard CouchDB error string for an HTTP error status.
@@ -90,13 +170,20 @@ func CouchHTTPErrorName(status int) string {
 
 // Returns true if an error is a doc-not-found error
 func IsDocNotFoundError(err error) bool {
-	switch err := err.(type) {
+
+	unwrappedErr := pkgerrors.Cause(err)
+
+	if unwrappedErr != nil && unwrappedErr == gocb.ErrKeyNotFound {
+		return true
+	}
+
+	switch unwrappedErr := unwrappedErr.(type) {
 	case *gomemcached.MCResponse:
-		return err.Status == gomemcached.KEY_ENOENT || err.Status == gomemcached.NOT_STORED
+		return unwrappedErr.Status == gomemcached.KEY_ENOENT || unwrappedErr.Status == gomemcached.NOT_STORED
 	case sgbucket.MissingError:
 		return true
 	case *HTTPError:
-		return err.Status == http.StatusNotFound
+		return unwrappedErr.Status == http.StatusNotFound
 	default:
 		return false
 	}

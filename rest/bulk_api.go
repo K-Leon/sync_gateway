@@ -11,17 +11,19 @@ package rest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"math"
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/couchbase/sync_gateway/base"
-	"github.com/couchbase/sync_gateway/channels"
+	ch "github.com/couchbase/sync_gateway/channels"
 	"github.com/couchbase/sync_gateway/db"
-	"time"
+	pkgerrors "github.com/pkg/errors"
 )
 
 var bulkApiBulkGetRollingMean = base.NewIntRollingMeanVar(100)
@@ -35,7 +37,6 @@ func init() {
 	base.StatsExpvars.Set("bulkApi.BulkGetPerDocRollingMean", &bulkApiBulkGetPerDocRollingMean)
 	base.StatsExpvars.Set("bulkApi.BulkDocsPerDocRollingMean", &bulkApiBulkDocsPerDocRollingMean)
 }
-
 
 // HTTP handler for _all_docs
 func (h *handler) handleAllDocs() error {
@@ -66,13 +67,13 @@ func (h *handler) handleAllDocs() error {
 	}
 
 	// Get the set of channels the user has access to; nil if user is admin or has access to user "*"
-	var availableChannels channels.TimedSet
+	var availableChannels ch.TimedSet
 	if h.user != nil {
 		availableChannels = h.user.InheritedChannels()
 		if availableChannels == nil {
 			panic("no channels for user?")
 		}
-		if availableChannels.Contains(channels.UserStarChannel) {
+		if availableChannels.Contains(ch.UserStarChannel) {
 			availableChannels = nil
 		}
 	}
@@ -103,7 +104,7 @@ func (h *handler) handleAllDocs() error {
 		}
 		return channels[0:dst]
 	}
-	filterChannelSet := func(channelMap channels.ChannelMap) []string {
+	filterChannelSet := func(channelMap ch.ChannelMap) []string {
 		var result []string
 		if availableChannels == nil {
 			result = []string{}
@@ -173,7 +174,7 @@ func (h *handler) handleAllDocs() error {
 					value.Access[userName] = channels.AsSet()
 				}
 				for roleName, channels := range roleAccess {
-					value.Access["role:"+roleName] = channels.AsSet()
+					value.Access[ch.RoleAccessPrefix+roleName] = channels.AsSet()
 				}
 			}
 		}
@@ -267,6 +268,48 @@ func (h *handler) handleDump() error {
 	return nil
 }
 
+// HTTP handler for _repair
+func (h *handler) handleRepair() error {
+
+	if true == true {
+		return errors.New("_repair endpoint disabled")
+	}
+
+	base.LogTo("HTTP", "Repair bucket")
+
+	// Todo: is this actually needed or does something else in the handler do it?  I can't find that..
+	defer h.requestBody.Close()
+
+	body, err := h.readBody()
+	if err != nil {
+		return err
+	}
+
+	repairBucketParams := db.RepairBucketParams{}
+	if err := json.Unmarshal(body, &repairBucketParams); err != nil {
+		return pkgerrors.Wrapf(err, "Error unmarshalling %v into RepairJobParams.", string(body))
+	}
+
+	repairBucket := db.NewRepairBucket(h.db.Bucket)
+
+	repairBucket.InitFrom(repairBucketParams)
+
+	repairBucketResult, repairDocsErr := repairBucket.RepairBucket()
+	if repairDocsErr != nil {
+		return err
+	}
+
+	resultMarshalled, err := json.Marshal(repairBucketResult)
+	if err != nil {
+		return pkgerrors.Wrapf(err, "Error marshalling repairBucketResult: %+v", repairBucketResult)
+	}
+
+	h.setHeader("Content-Type", "application/json")
+	_, err = h.response.Write(resultMarshalled)
+
+	return err
+}
+
 // HTTP handler for _dumpchannel
 func (h *handler) handleDumpChannel() error {
 	channelName := h.PathVar("channel")
@@ -346,7 +389,6 @@ func (h *handler) handleBulkGet() error {
 
 	defer bulkApiBulkGetPerDocRollingMean.AddSincePerItem(handleBulkGetStartedAt, len(docs))
 
-
 	err = h.writeMultipart("mixed", func(writer *multipart.Writer) error {
 		for _, item := range docs {
 			var body db.Body
@@ -421,14 +463,22 @@ func (h *handler) handleBulkDocs() error {
 	}
 	lenDocs := len(userDocs)
 
-	defer bulkApiBulkDocsPerDocRollingMean.AddSincePerItem(handleBulkDocsStartedAt, len(userDocs))
+	defer bulkApiBulkDocsPerDocRollingMean.AddSincePerItem(handleBulkDocsStartedAt, lenDocs)
 
 	// split out local docs, save them on their own
 	localDocs := make([]interface{}, 0, lenDocs)
 	docs := make([]interface{}, 0, lenDocs)
 	for _, item := range userDocs {
-		doc := item.(map[string]interface{})
+		doc, ok := item.(map[string]interface{})
+		if !ok {
+			err = base.HTTPErrorf(http.StatusBadRequest, "Document body must be JSON")
+			return err
+		}
+
+		// If ID is present, check whether local doc. (note: if _id is absent or non-string, docid will be
+		// empty string and handled during normal doc processing)
 		docid, _ := doc["_id"].(string)
+
 		if strings.HasPrefix(docid, "_local/") {
 			localDocs = append(localDocs, doc)
 		} else {

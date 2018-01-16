@@ -60,7 +60,7 @@ func init() {
 	base.StatsExpvars.Set("indexReader.getChanges.UseIndexed", &indexReaderGetChangesUseIndexed)
 }
 
-func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIndexOptions, onChange func(base.Set), indexPartitionsCallback IndexPartitionsFunc, context *DatabaseContext) (err error) {
+func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChannelIndexOptions, onChange func(base.Set), indexPartitionsCallback IndexPartitionsFunc, context *DatabaseContext) (err error) {
 
 	k.channelIndexReaders = make(map[string]*KvChannelIndex)
 	k.indexPartitionsCallback = indexPartitionsCallback
@@ -77,12 +77,9 @@ func (k *kvChangeIndexReader) Init(options *CacheOptions, indexOptions *ChangeIn
 		return err
 	}
 
-	cbBucket, ok := k.indexReadBucket.(base.CouchbaseBucket)
-	if ok {
-		k.maxVbNo, _ = cbBucket.GetMaxVbno()
-	} else {
-		// walrus, for unit testing
-		k.maxVbNo = 1024
+	k.maxVbNo, err = k.indexReadBucket.GetMaxVbno()
+	if err != nil {
+		return err
 	}
 
 	// Make sure that the index bucket and data bucket have correct sequence parity
@@ -292,10 +289,10 @@ func (k *kvChangeIndexReader) GetChanges(channelName string, options ChangesOpti
 		sinceClock = options.Since.Clock
 	}
 
-	return k.GetChangesForRange(channelName, sinceClock, nil, options.Limit)
+	return k.GetChangesForRange(channelName, sinceClock, nil, options.Limit, options.ActiveOnly)
 }
 
-func (k *kvChangeIndexReader) GetChangesForRange(channelName string, sinceClock base.SequenceClock, toClock base.SequenceClock, limit int) ([]*LogEntry, error) {
+func (k *kvChangeIndexReader) GetChangesForRange(channelName string, sinceClock base.SequenceClock, toClock base.SequenceClock, limit int, activeOnly bool) ([]*LogEntry, error) {
 
 	defer indexReaderGetChangesTime.AddSince(time.Now())
 	defer indexReaderGetChangesCount.Add(1)
@@ -305,7 +302,7 @@ func (k *kvChangeIndexReader) GetChangesForRange(channelName string, sinceClock 
 		base.Warn("Error obtaining channel reader (need partition index?) for channel %s", channelName)
 		return nil, err
 	}
-	changes, err := reader.GetChanges(sinceClock, toClock, limit)
+	changes, err := reader.GetChanges(sinceClock, toClock, limit, activeOnly)
 	if err != nil {
 		base.LogTo("DIndex+", "No clock found for channel %s, assuming no entries in index", channelName)
 		return nil, nil
@@ -483,7 +480,7 @@ func (k *kvChangeIndexReader) pollPrincipals() {
 	var changedWaitKeys []string
 
 	// When using a gocb bucket, use a single bulk operation to retrieve counters.
-	if gocbIndexBucket, ok := k.indexReadBucket.(base.CouchbaseBucketGoCB); ok {
+	if gocbIndexBucket, err := base.GetGoCBBucketFromBaseBucket(k.indexReadBucket); err == nil {
 		principalKeySet := make([]string, len(k.activePrincipalCounts))
 		i := 0
 		for principalID, _ := range k.activePrincipalCounts {

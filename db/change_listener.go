@@ -15,18 +15,20 @@ import (
 // changes.
 type changeListener struct {
 	bucket                base.Bucket
-	bucketName            string                 // Used for logging
-	tapFeed               base.TapFeed           // Observes changes to bucket
-	tapNotifier           *sync.Cond             // Posts notifications when documents are updated
-	TapArgs               sgbucket.TapArguments  // The Tap Args (backfill, etc)
-	counter               uint64                 // Event counter; increments on every doc update
-	terminateCheckCounter uint64                 // Termination Event counter; increments on every notifyCheckForTermination
-	keyCounts             map[string]uint64      // Latest count at which each doc key was updated
-	DocChannel            chan sgbucket.TapEvent // Passthru channel for doc mutations
-	OnDocChanged          DocChangedFunc         // Called when change arrives on feed
+	bucketName            string                  // Used for logging
+	tapFeed               base.TapFeed            // Observes changes to bucket
+	tapNotifier           *sync.Cond              // Posts notifications when documents are updated
+	FeedArgs              sgbucket.FeedArguments  // The Tap Args (backfill, etc)
+	counter               uint64                  // Event counter; increments on every doc update
+	terminateCheckCounter uint64                  // Termination Event counter; increments on every notifyCheckForTermination
+	keyCounts             map[string]uint64       // Latest count at which each doc key was updated
+	DocChannel            chan sgbucket.FeedEvent // Passthru channel for doc mutations
+	OnDocChanged          DocChangedFunc          // Called when change arrives on feed
+	trackDocs             bool                    // Whether events should be routed to DocChannel passthru
+	terminator            chan bool               // Signal to cause cbdatasource bucketdatasource.Close() to be called, which removes dcp receiver
 }
 
-type DocChangedFunc func(docID string, jsonData []byte, seq uint64, vbNo uint16)
+type DocChangedFunc func(event sgbucket.FeedEvent)
 
 func (listener *changeListener) Init(name string) {
 	listener.bucketName = name
@@ -37,62 +39,107 @@ func (listener *changeListener) Init(name string) {
 }
 
 // Starts a changeListener on a given Bucket.
-func (listener *changeListener) Start(bucket base.Bucket, trackDocs bool, notify sgbucket.BucketNotifyFn) error {
+
+func (listener *changeListener) Start(bucket base.Bucket, trackDocs bool, backfillMode uint64, bucketStateNotify sgbucket.BucketNotifyFn) error {
+
+	listener.terminator = make(chan bool)
 	listener.bucket = bucket
 	listener.bucketName = bucket.GetName()
-	listener.TapArgs = sgbucket.TapArguments{
-		Backfill: sgbucket.TapNoBackfill,
-		Notify:   notify,
-	}
-	tapFeed, err := bucket.StartTapFeed(listener.TapArgs)
-	if err != nil {
-		return err
+	listener.FeedArgs = sgbucket.FeedArguments{
+		Backfill:   backfillMode,
+		Notify:     bucketStateNotify,
+		Terminator: listener.terminator,
 	}
 
-	listener.tapFeed = tapFeed
 	if trackDocs {
-		listener.DocChannel = make(chan sgbucket.TapEvent, 100)
+		listener.DocChannel = make(chan sgbucket.FeedEvent, 100)
+		listener.trackDocs = true
 	}
 
-	// Start a goroutine to broadcast to the tapNotifier whenever a channel or user/role changes:
-	go func() {
-		defer func() {
-			listener.notifyStopping()
-			if listener.DocChannel != nil {
-				close(listener.DocChannel)
+	return listener.StartMutationFeed(bucket)
+}
+
+func (listener *changeListener) StartMutationFeed(bucket base.Bucket) error {
+
+	// Uses DCP by default, unless TAP is explicitly specified
+	feedType := base.GetFeedType(bucket)
+	switch feedType {
+	case base.TapFeedType:
+		// TAP Feed
+		//    TAP feed is a go-channel of Tap events served by the bucket.  Start the feed, then
+		//    start a goroutine to work the event channel, calling ProcessEvent for each event
+		var err error
+		listener.tapFeed, err = bucket.StartTapFeed(listener.FeedArgs)
+		if err != nil {
+			return err
+		}
+		go func() {
+			defer func() {
+				listener.notifyStopping()
+				if listener.DocChannel != nil {
+					close(listener.DocChannel)
+				}
+			}()
+			for event := range listener.tapFeed.Events() {
+				listener.ProcessFeedEvent(event)
 			}
 		}()
-		for event := range tapFeed.Events() {
-			if event.Opcode == sgbucket.TapMutation || event.Opcode == sgbucket.TapDeletion {
-				key := string(event.Key)
-				if strings.HasPrefix(key, auth.UserKeyPrefix) ||
-					strings.HasPrefix(key, auth.RoleKeyPrefix) {
-					if listener.OnDocChanged != nil {
-						listener.OnDocChanged(key, event.Value, event.Sequence, event.VbNo)
-					}
-					listener.Notify(base.SetOf(key))
-				} else if strings.HasPrefix(key, UnusedSequenceKeyPrefix) {
-					if listener.OnDocChanged != nil {
-						listener.OnDocChanged(key, event.Value, event.Sequence, event.VbNo)
-					}
-				} else if !strings.HasPrefix(key, KSyncKeyPrefix) && !strings.HasPrefix(key, base.KIndexPrefix) {
-					if listener.OnDocChanged != nil {
-						listener.OnDocChanged(key, event.Value, event.Sequence, event.VbNo)
-					}
-					if trackDocs {
-						listener.DocChannel <- event
-					}
+		return nil
+	default:
+		// DCP Feed
+		//    DCP receiver isn't go-channel based - DCPReceiver calls ProcessEvent directly.
+		base.LogTo("Feed", "Using DCP feed for bucket: %q (based on feed_type specified in config file)", bucket.GetName())
+		return bucket.StartDCPFeed(listener.FeedArgs, listener.ProcessFeedEvent)
+	}
+}
 
-				}
+// ProcessFeedEvent is invoked for each mutate or delete event seen on the server's mutation feed (TAP or DCP).  Uses document
+// key to determine handling, based on whether the incoming mutation is an internal Sync Gateway document.
+func (listener *changeListener) ProcessFeedEvent(event sgbucket.FeedEvent) bool {
+	requiresCheckpointPersistence := true
+	if event.Opcode == sgbucket.FeedOpMutation || event.Opcode == sgbucket.FeedOpDeletion {
+		key := string(event.Key)
+		if strings.HasPrefix(key, auth.UserKeyPrefix) ||
+			strings.HasPrefix(key, auth.RoleKeyPrefix) { // SG users and roles
+			if listener.OnDocChanged != nil && event.Opcode == sgbucket.FeedOpMutation {
+				listener.OnDocChanged(event)
 			}
-		}
-	}()
+			listener.Notify(base.SetOf(key))
+		} else if strings.HasPrefix(key, UnusedSequenceKeyPrefix) { // SG unused sequence marker docs
+			if listener.OnDocChanged != nil {
+				listener.OnDocChanged(event)
+			}
+		} else if strings.HasPrefix(key, base.DCPCheckpointPrefix) { // SG DCP checkpoint docs
+			// Do not require checkpoint persistence when DCP checkpoint docs come back over DCP - otherwise
+			// we'll end up in a feedback loop for their vbucket
+			requiresCheckpointPersistence = false
+		} else if !strings.HasPrefix(key, KSyncKeyPrefix) && !strings.HasPrefix(key, base.KIndexPrefix) { // Non-SG docs
+			if listener.OnDocChanged != nil {
+				listener.OnDocChanged(event)
+			}
+			if listener.trackDocs {
+				listener.DocChannel <- event
+			}
 
-	return nil
+		}
+	}
+	return requiresCheckpointPersistence
 }
 
 // Stops a changeListener. Any pending Wait() calls will immediately return false.
 func (listener *changeListener) Stop() {
+
+	base.LogTo("Changes+", "changeListener.Stop() called")
+
+	if listener.terminator != nil {
+		close(listener.terminator)
+	}
+
+	if listener.tapNotifier != nil {
+		// Unblock any change listeners blocked on tapNotifier.Wait()
+		listener.tapNotifier.Broadcast()
+	}
+
 	if listener.tapFeed != nil {
 		listener.tapFeed.Close()
 	}
@@ -153,15 +200,26 @@ func (listener *changeListener) notifyStopping() {
 func (listener *changeListener) Wait(keys []string, counter uint64, terminateCheckCounter uint64) (uint64, uint64) {
 	listener.tapNotifier.L.Lock()
 	defer listener.tapNotifier.L.Unlock()
-	base.LogTo("Changes+", "Waiting for %q's count to pass %d",
+	base.LogTo("Changes+", "No new changes to send to change listener.  Waiting for %q's count to pass %d",
 		listener.bucketName, counter)
+
 	for {
 		curCounter := listener._currentCount(keys)
 
 		if curCounter != counter || listener.terminateCheckCounter != terminateCheckCounter {
 			return curCounter, listener.terminateCheckCounter
 		}
+
 		listener.tapNotifier.Wait()
+
+		// Don't go back through the for loop if this changeListener was terminated
+		select {
+		case <-listener.terminator:
+			return 0, 0
+		default:
+			// do nothing
+		}
+
 	}
 }
 

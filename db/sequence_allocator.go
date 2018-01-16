@@ -84,7 +84,17 @@ func (s *sequenceAllocator) incrWithRetry(key string, numToReserve uint64) (uint
 	var err error
 	var max uint64
 	retries := 0
-	for retries < kMaxIncrRetries {
+	maxRetries := kMaxIncrRetries
+
+	// type assertion to hybrid bucket
+	_, ok := s.bucket.(*base.CouchbaseBucketGoCB)
+	if ok {
+		// CouchbaseBucketGoCB already has it's own retry mechanism, so short-circuit
+		// retry mechanism in incrWithRetry
+		maxRetries = 1
+	}
+
+	for retries < maxRetries {
 		max, err = s.bucket.Incr(key, numToReserve, numToReserve, 0)
 		if err != nil {
 			retries++
@@ -99,7 +109,7 @@ func (s *sequenceAllocator) incrWithRetry(key string, numToReserve uint64) (uint
 	//       is nil by the time we log the warning above.  This seems most likely to be a race/scope issue with the callback processing
 	//       in the go-couchbase Incr/Do, and the sleep after the last attempt above.  Forcing the error to non-nil here to ensure we don't
 	//       proceed without an error in this case.
-	return 0, fmt.Errorf("Unable to increment sequence: %v", err)
+	return 0, err
 }
 
 // ReleaseSequence writes an unused sequence document, used to notify sequence buffering that a sequence has been allocated and not used.

@@ -12,17 +12,18 @@ package base
 import (
 	"errors"
 	"fmt"
-	"github.com/couchbase/clog"
-	"github.com/natefinch/lumberjack"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
-	"net/http"
+
+	"github.com/couchbase/clog"
 	"github.com/couchbase/goutils/logging"
+	"github.com/natefinch/lumberjack"
 )
 
 var errMarshalNilLevel = errors.New("can't marshal a nil *Level to text")
@@ -71,7 +72,7 @@ const (
 // and then a division by 2 and return the ceil of the result
 // to round to nearest int sgLevel value
 func (l Level) sgLevel() int {
-	return int(math.Ceil(float64(l + 2) / float64(2)))
+	return int(math.Ceil(float64(l+2) / float64(2)))
 }
 
 // cgLevel returns a compatible go-couchbase/golog Log Level for
@@ -248,6 +249,14 @@ func LogNoTime() {
 	logNoTime = true
 }
 
+func LogTime() {
+	logLock.RLock()
+	defer logLock.RUnlock()
+	//Enable timestamp for default logger, this may be used by other packages
+	log.SetFlags(log.Flags() | (log.Ldate | log.Ltime | log.Lmicroseconds))
+	logNoTime = false
+}
+
 // Parses a comma-separated list of log keys, probably coming from an argv flag.
 // The key "bw" is interpreted as a call to LogNoColor, not a key.
 func ParseLogFlag(flag string) {
@@ -264,7 +273,7 @@ func (config *LogAppenderConfig) ValidateLogAppender() error {
 			return fmt.Errorf("The default logger must define a \"logFilePath\" when \"rotation\" is defined")
 		}
 		if _, err := IsFilePathWritable(*config.LogFilePath); err != nil {
-			return fmt.Errorf("logFilePath %s is not writable, error: %v", *config.LogFilePath, err)
+			return err
 		}
 		if config.Rotation.MaxSize < 0 {
 			return fmt.Errorf("Log rotation MaxSize must >= 0")
@@ -284,39 +293,96 @@ func (config *LogAppenderConfig) ValidateLogAppender() error {
 // The key "bw" is interpreted as a call to LogNoColor, not a key.
 func ParseLogFlags(flags []string) {
 	logLock.Lock()
+	keyMap := make(map[string]bool)
+
 	for _, key := range flags {
-		switch key {
-		case "bw":
-			LogNoColor()
-		case "color":
-			LogColor()
-		case "notime":
-			LogNoTime()
-		default:
-			LogKeys[key] = true
-			if key == "*" {
-				logStar = true
-				EnableSgReplicateLogging()
-			}
-			// gocb requires a call into the gocb library to enable logging
-			if key == "gocb" {
-				EnableGoCBLogging()
-			}
-			if key == "Replicate" {
-				EnableSgReplicateLogging()
-			}
-			for strings.HasSuffix(key, "+") {
-				key = key[0: len(key) - 1]
-				LogKeys[key] = true // "foo+" also enables "foo"
-			}
-		}
+		keyMap[key] = true
 	}
+
+	ParseLogFlagsMap(keyMap)
 	logLock.Unlock()
 	Logf("Enabling logging: %s", flags)
 }
 
+// Parses a map of log keys and enabled bool, probably coming from a argv flags.
+// The key "bw" is interpreted as a call to LogNoColor, not a key.
+func ParseLogFlagsMap(flags map[string]bool) {
+	for key, enabled := range flags {
+		switch key {
+		case "bw":
+			if enabled {
+				LogNoColor()
+			} else {
+				LogColor()
+			}
+		case "color":
+			if enabled {
+				LogColor()
+			} else {
+				LogNoColor()
+			}
+		case "notime":
+			if enabled {
+				LogNoTime()
+			} else {
+				LogTime()
+			}
+		default:
+			if enabled {
+				LogKeys[key] = enabled
+				for strings.HasSuffix(key, "+") {
+					key = key[0 : len(key)-1]
+					LogKeys[key] = enabled // "foo+" also enables "foo"
+				}
+			} else {
+				delete(LogKeys, key)
+				//if key already has "++" suffix there is no further processing
+				// else if it has "+" suffix disable "++" suffix as well
+				// else disable "+" suffix and "++" suffix
+				if !strings.HasSuffix(key, "++") {
+					//If key does not have a "+" suffix then remove "+" suffix
+					if !strings.HasSuffix(key, "+") {
+						// remove the "+" suffix as well
+						delete(LogKeys, key+"+")
+						// remove the "++" suffix as well
+						delete(LogKeys, key+"++")
+					} else {
+						// remove the "++" suffix as well
+						delete(LogKeys, key+"+")
+					}
+				}
+			}
+			if key == "*" {
+				logStar = enabled
+				if enabled {
+					EnableSgReplicateLogging()
+				}
+			}
+			// gocb requires a call into the gocb library to enable logging
+			if key == "gocb" {
+				if enabled {
+					EnableGoCBLogging()
+				} else {
+					DisableGoCBLogging()
+				}
+			}
+			if key == "Replicate" {
+				if enabled {
+					EnableSgReplicateLogging()
+				} else {
+					DisableSgReplicateLogging()
+				}
+			}
+		}
+	}
+}
+
 func EnableSgReplicateLogging() {
 	clog.EnableKey("Replicate")
+}
+
+func DisableSgReplicateLogging() {
+	clog.DisableKey("Replicate")
 }
 
 func GetLogKeys() map[string]bool {
@@ -335,12 +401,8 @@ func UpdateLogKeys(keys map[string]bool, replace bool) {
 	if replace {
 		LogKeys = map[string]bool{}
 	}
-	for k, v := range keys {
-		LogKeys[k] = v
-		if k == "*" {
-			logStar = v
-		}
-	}
+
+	ParseLogFlagsMap(keys)
 }
 
 // Returns a string identifying a function on the call stack.
@@ -488,9 +550,9 @@ func printf(format string, args ...interface{}) {
 
 func lastComponent(path string) string {
 	if index := strings.LastIndex(path, "/"); index >= 0 {
-		path = path[index + 1:]
+		path = path[index+1:]
 	} else if index = strings.LastIndex(path, "\\"); index >= 0 {
-		path = path[index + 1:]
+		path = path[index+1:]
 	}
 	return path
 }
@@ -550,13 +612,17 @@ func NewLoggerWriter(logKey string, serialNumber uint64, req *http.Request) *Log
 
 func CreateRollingLogger(logConfig *LogAppenderConfig) {
 	if logConfig != nil {
-		lj := lumberjack.Logger{}
+		SetLogLevel(logConfig.LogLevel.sgLevel())
+		ParseLogFlags(logConfig.LogKeys)
 
-		if logConfig.LogFilePath != nil {
-			lj.Filename = *logConfig.LogFilePath
+		if logConfig.LogFilePath == nil {
+			return
 		}
 
-		SetLogLevel(logConfig.LogLevel.sgLevel())
+		lj := lumberjack.Logger{}
+
+		lj.Filename = *logConfig.LogFilePath
+		log.Printf("Log entries will be written to the file %v", *logConfig.LogFilePath)
 
 		if rotation := logConfig.Rotation; rotation != nil {
 			if rotation.MaxSize > 0 {
@@ -571,7 +637,6 @@ func CreateRollingLogger(logConfig *LogAppenderConfig) {
 			lj.LocalTime = rotation.LocalTime
 		}
 
-		log.Printf("Log entries will be written to the file %v", *logConfig.LogFilePath)
 		//Update default GoLang logger to use new rolling logger
 		logger.SetOutput(&lj)
 

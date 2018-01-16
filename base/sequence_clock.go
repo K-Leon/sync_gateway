@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	pkgerrors "github.com/pkg/errors"
 )
 
 const (
@@ -570,7 +571,7 @@ func (i *IndexablePartitionClock) UnmarshalJSON(data []byte) error {
 	// Reset clock based on storage
 	err := json.Unmarshal(data, i.storage)
 	if err != nil {
-		return err
+		return pkgerrors.Wrapf(err, "Error unmarshalling IndexablePartitionClock: %s", i.Key)
 	}
 	if len(i.storage.VbNos) != len(i.storage.Seqs) {
 		return fmt.Errorf("Error unmarshalling clock %s: mismatched lengths (%d, %d)", i.Key, len(i.storage.VbNos), len(i.storage.Seqs))
@@ -618,6 +619,16 @@ func (clock PartitionClock) GetSequence(vbNo uint16) uint64 {
 	} else {
 		return 0
 	}
+}
+
+func (clock PartitionClock) IsZero() bool {
+	isZero := true
+	for _, seq := range clock {
+		if seq > 0 {
+			isZero = false
+		}
+	}
+	return isZero
 }
 
 func (clock PartitionClock) AddToClock(seqClock SequenceClock) {

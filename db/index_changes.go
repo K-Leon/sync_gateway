@@ -30,7 +30,7 @@ func (db *Database) VectorMultiChangesFeed(chans base.Set, options ChangesOption
 		to = fmt.Sprintf("  (to %s)", db.user.Name())
 		userVbNo = uint16(db.Bucket.VBHash(db.user.DocID()))
 	}
-	base.LogTo("Changes+", "Vector MultiChangesFeed(%s, %+v) ... %s", chans, options, to)
+	base.LogTo("Changes+", "Vector MultiChangesFeed(channels: %s, options: %+v) ... %s", chans, options, to)
 
 	output := make(chan *ChangeEntry, 50)
 
@@ -651,7 +651,7 @@ func (db *Database) vectorChangesFeed(channel string, options ChangesOptions, se
 	switch feedType {
 	case ChannelFeedType_Standard:
 		// Standard (non-backfill) changes feed - get everything from since to stable clock
-		log, err = changeIndex.reader.GetChangesForRange(channel, options.Since.Clock, stableClock, options.Limit)
+		log, err = changeIndex.reader.GetChangesForRange(channel, options.Since.Clock, stableClock, options.Limit, options.ActiveOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -665,14 +665,14 @@ func (db *Database) vectorChangesFeed(channel string, options ChangesOptions, se
 		triggerPosition := base.VbSeq{options.Since.TriggeredByVbNo, options.Since.TriggeredBy}
 
 		backfillFrom, backfillTo := calculateBackfillRange(backfillPosition, triggerPosition, options.Since.TriggeredByClock)
-		backfillLog, err = changeIndex.reader.GetChangesForRange(channel, backfillFrom, backfillTo, options.Limit)
+		backfillLog, err = changeIndex.reader.GetChangesForRange(channel, backfillFrom, backfillTo, options.Limit, options.ActiveOnly)
 		if err != nil {
 			return nil, err
 		}
 		base.LogTo("Changes+", "[changesFeed] Found %d backfill changes for channel %s", len(backfillLog), channel)
 		// If we still have room, get non-backfill entries
 		if options.Limit == 0 || len(backfillLog) < options.Limit {
-			log, err = changeIndex.reader.GetChangesForRange(channel, backfillTo, nil, options.Limit)
+			log, err = changeIndex.reader.GetChangesForRange(channel, backfillTo, nil, options.Limit, options.ActiveOnly)
 			if err != nil {
 				return nil, err
 			}
@@ -748,7 +748,7 @@ func (db *Database) vectorChangesFeed(channel string, options ChangesOptions, se
 			options.Since.TriggeredByClock.SetHashedValue(clockHash)
 
 			// Get everything from zero to the cumulative clock as backfill
-			backfillLog, err = changeIndex.reader.GetChangesForRange(channel, base.NewSequenceClockImpl(), cumulativeClock, options.Limit)
+			backfillLog, err = changeIndex.reader.GetChangesForRange(channel, base.NewSequenceClockImpl(), cumulativeClock, options.Limit, options.ActiveOnly)
 			if err != nil {
 				base.Warn("Error processing backfill changes for channel %s: %v", channel, err)
 				return
@@ -756,7 +756,7 @@ func (db *Database) vectorChangesFeed(channel string, options ChangesOptions, se
 
 			// If we still have room, get everything from the cumulative clock to the stable clock as non-backfill
 			if options.Limit == 0 || len(backfillLog) < options.Limit {
-				log, err = changeIndex.reader.GetChangesForRange(channel, cumulativeClock, stableClock, options.Limit)
+				log, err = changeIndex.reader.GetChangesForRange(channel, cumulativeClock, stableClock, options.Limit, options.ActiveOnly)
 				if err != nil {
 					base.Warn("Error processing changes for channel %s: %v", channel, err)
 					return
@@ -842,9 +842,10 @@ func (db *Database) appendVectorUserFeed(feeds []<-chan *ChangeEntry, names []st
 				name = base.GuestUsername
 			}
 			entry := ChangeEntry{
-				Seq:     userSeq,
-				ID:      "_user/" + name,
-				Changes: []ChangeRev{},
+				Seq:       userSeq,
+				ID:        "_user/" + name,
+				Changes:   []ChangeRev{},
+				pseudoDoc: true,
 			}
 			userFeed := make(chan *ChangeEntry, 1)
 			userFeed <- &entry

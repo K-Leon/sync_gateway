@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 
+	sgbucket "github.com/couchbase/sg-bucket"
 	"github.com/couchbase/sync_gateway/base"
 )
 
@@ -45,7 +46,7 @@ func init() {
 	IndexExpvars = expvar.NewMap("syncGateway_index")
 }
 
-func (k *kvChangeIndex) Init(context *DatabaseContext, lastSequence SequenceID, onChange func(base.Set), options *CacheOptions, indexOptions *ChangeIndexOptions) (err error) {
+func (k *kvChangeIndex) Init(context *DatabaseContext, lastSequence SequenceID, onChange func(base.Set), options *CacheOptions, indexOptions *ChannelIndexOptions) (err error) {
 
 	k.context = context
 	k.reader = &kvChangeIndexReader{}
@@ -174,9 +175,9 @@ func (k *kvChangeIndex) setIndexPartitionMap(partitionMap base.IndexPartitionMap
 	}
 }
 
-func (k *kvChangeIndex) DocChanged(docID string, docJSON []byte, seq uint64, vbNo uint16) {
+func (k *kvChangeIndex) DocChanged(event sgbucket.FeedEvent) {
 	// no-op for reader
-	base.Warn("DocChanged called in index reader for doc %s, will be ignored.", docID)
+	base.Warn("DocChanged called in index reader for doc %s, will be ignored.", event.Key)
 }
 
 // No-ops - pending refactoring of change_cache.go to remove usage (or deprecation of

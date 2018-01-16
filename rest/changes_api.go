@@ -14,6 +14,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -75,7 +76,7 @@ func (h *handler) updateChangesOptionsFromQuery(feed *string, options *db.Change
 		return channelsArray, docIdsArray, nil
 	}
 
-	values := h.rq.URL.Query()
+	values := h.getQueryValues()
 
 	if _, ok := values["feed"]; ok {
 		*feed = h.getQuery("feed")
@@ -133,7 +134,7 @@ func (h *handler) updateChangesOptionsFromQuery(feed *string, options *db.Change
 
 	if _, ok := values["heartbeat"]; ok {
 		options.HeartbeatMs = getRestrictedIntQuery(
-			h.rq.URL.Query(),
+			h.getQueryValues(),
 			"heartbeat",
 			kDefaultHeartbeatMS,
 			kMinHeartbeatMS,
@@ -144,7 +145,7 @@ func (h *handler) updateChangesOptionsFromQuery(feed *string, options *db.Change
 
 	if _, ok := values["timeout"]; ok {
 		options.TimeoutMs = getRestrictedIntQuery(
-			h.rq.URL.Query(),
+			h.getQueryValues(),
 			"timeout",
 			kDefaultTimeoutMS,
 			0,
@@ -202,7 +203,7 @@ func (h *handler) handleChanges() error {
 		}
 
 		options.HeartbeatMs = getRestrictedIntQuery(
-			h.rq.URL.Query(),
+			h.getQueryValues(),
 			"heartbeat",
 			kDefaultHeartbeatMS,
 			kMinHeartbeatMS,
@@ -210,7 +211,7 @@ func (h *handler) handleChanges() error {
 			true,
 		)
 		options.TimeoutMs = getRestrictedIntQuery(
-			h.rq.URL.Query(),
+			h.getQueryValues(),
 			"timeout",
 			kDefaultTimeoutMS,
 			0,
@@ -225,6 +226,7 @@ func (h *handler) handleChanges() error {
 			return err
 		}
 		feed, options, filter, channelsArray, docIdsArray, _, err = h.readChangesOptionsFromJSON(body)
+
 		if err != nil {
 			return err
 		}
@@ -232,6 +234,14 @@ func (h *handler) handleChanges() error {
 		if err != nil {
 			return err
 		}
+
+		to := ""
+		if h.user != nil && h.user.Name() != "" {
+			to = fmt.Sprintf("  (to %s)", h.user.Name())
+		}
+
+		base.LogTo("Changes+", "Changes POST request.  URL: %v, feed: %v, options: %+v, filter: %v, bychannel: %v, docIds: %v %s",
+			h.rq.URL, feed, options, filter, channelsArray, docIdsArray, to)
 
 	}
 
@@ -515,6 +525,15 @@ func (h *handler) sendChangesForDocIds(userChannels base.Set, explicitDocIds []s
 // It will call send(nil) to notify that it's caught up and waiting for new changes, or as
 // a periodic heartbeat while waiting.
 func (h *handler) generateContinuousChanges(inChannels base.Set, options db.ChangesOptions, send func([]*db.ChangeEntry) error) (error, bool) {
+	err, forceClose := generateContinuousChanges(h.db, inChannels, options, nil, send)
+	h.logStatus(http.StatusOK, "OK (continuous feed closed)")
+	return err, forceClose
+}
+
+// Shell of the continuous changes feed -- calls out to a `send` function to deliver the change.
+// This is called from BLIP connections as well as HTTP handlers, which is why this is not a
+// method on `handler`. (In the BLIP case the `h` parameter will be nil.)
+func generateContinuousChanges(database *db.Database, inChannels base.Set, options db.ChangesOptions, h *handler, send func([]*db.ChangeEntry) error) (error, bool) {
 	// Set up heartbeat/timeout
 	var timeoutInterval time.Duration
 	var timer *time.Timer
@@ -540,11 +559,13 @@ func (h *handler) generateContinuousChanges(inChannels base.Set, options db.Chan
 	var err error
 
 	var closeNotify <-chan bool
-	cn, ok := h.response.(http.CloseNotifier)
-	if ok {
-		closeNotify = cn.CloseNotify()
-	} else {
-		base.LogTo("Changes", "continuous changes cannot get Close Notifier from ResponseWriter")
+	if h != nil {
+		cn, ok := h.response.(http.CloseNotifier)
+		if ok {
+			closeNotify = cn.CloseNotify()
+		} else {
+			base.LogTo("Changes", "continuous changes cannot get Close Notifier from ResponseWriter")
+		}
 	}
 
 	forceClose := false
@@ -556,11 +577,11 @@ loop:
 			if lastSeq.IsNonZero() { // start after end of last feed
 				options.Since = lastSeq
 			}
-			if h.db.IsClosed() {
+			if database.IsClosed() {
 				forceClose = true
 				break loop
 			}
-			feed, err = h.db.MultiChangesFeed(inChannels, options)
+			feed, err = database.MultiChangesFeed(inChannels, options)
 			if err != nil || feed == nil {
 				return err, forceClose
 			}
@@ -626,7 +647,9 @@ loop:
 			}
 		case <-heartbeat:
 			err = send(nil)
-			base.LogTo("Heartbeat", "heartbeat written to _changes feed for request received %s", h.currentEffectiveUserName())
+			if h != nil {
+				base.LogTo("Heartbeat", "heartbeat written to _changes feed for request received %s", h.currentEffectiveUserName())
+			}
 		case <-timeout:
 			forceClose = true
 			break loop
@@ -634,18 +657,19 @@ loop:
 			base.LogTo("Changes", "Connection lost from client: %v", h.currentEffectiveUserName())
 			forceClose = true
 			break loop
-		case <-h.db.ExitChanges:
+		case <-database.ExitChanges:
 			forceClose = true
 			break loop
 		}
 
 		if err != nil {
-			h.logStatus(http.StatusOK, fmt.Sprintf("Write error: %v", err))
+			if h != nil {
+				h.logStatus(http.StatusOK, fmt.Sprintf("Write error: %v", err))
+			}
 			return nil, forceClose // error is probably because the client closed the connection
 		}
 	}
 
-	h.logStatus(http.StatusOK, "OK (continuous feed closed)")
 	return nil, forceClose
 }
 
@@ -813,21 +837,18 @@ func (h *handler) readChangesOptionsFromJSON(jsonData []byte) (feed string, opti
 	return
 }
 
-// Helper function to read a complete message from a WebSocket (because the API makes it hard)
+// Helper function to read a complete message from a WebSocket
 func readWebSocketMessage(conn *websocket.Conn) ([]byte, error) {
+
 	var message []byte
-	buf := make([]byte, 100)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
+	if err := websocket.Message.Receive(conn, &message); err != nil {
+		if err != io.EOF {
+			base.Warn("Error reading initial websocket message: %v", err)
 			return nil, err
-		}
-		message = append(message, buf[0:n]...)
-		if n < len(buf) {
-			break
 		}
 	}
 	return message, nil
+
 }
 
 func sequenceFromString(str string) uint64 {
